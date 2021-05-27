@@ -12,9 +12,12 @@ Não é necessário instalar nenhum programa em seu computador para seguir este 
 
 Existe um unico Jupyter Notebook neste repositório:
 
-## [Intro_LDE_Devito](https://nbviewer.jupyter.org/format/slides/github/ofmla/curso_sapct/blob/master/intro_lde_devito.ipynb#)
-Contém uma introdução fácil à LDE Devito (clique para acessar a apresentação de slides)
-[https://nbviewer.jupyter.org/format/slides/github/ofmla/curso_sapct/blob/master/intro_lde_devito.ipynb#](https://nbviewer.jupyter.org/format/slides/github/ofmla/curso_sapct/blob/master/intro_lde_devito.ipynb#)
+## [Intro_LDE_Devito](https://nbviewer.jupyter.org/github/ofmla/curso_sapct/blob/main/intro_lde_devito.ipynb)
+Contém uma introdução fácil à LDE Devito (siga os passos a seguir para acessar o notebook online)
+
+* Clique em [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/ofmla/curso_sapct/HEAD) (que lançará o repositório https://github.com/ofmla/curso_sapct). Isso às vezes pode levar alguns minutos, então seja paciente ...
+* Espere até que ele seja carregado
+* Clique no notebook intro_lde_devito.ipynb
 
 ---
 Espero que você ache o Framework Devito útil.
