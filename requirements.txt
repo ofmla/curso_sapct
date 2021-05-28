@@ -19,3 +19,4 @@ pytest>=3.6,<7.0
 pytest-runner
 pytest-cov
 matplotlib
+antlr4-python3-runtime
