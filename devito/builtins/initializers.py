@@ -7,7 +7,8 @@ from devito.builtins.utils import nbl_to_padsize, pad_outhalo
 __all__ = ['assign', 'smooth', 'gaussian_smooth', 'initialize_function']
 
 
-def assign(f, rhs=0, options=None, name='assign', **kwargs):
+@dv.switchconfig(log_level='ERROR')
+def assign(f, rhs=0, options=None, name='assign', assign_halo=False, **kwargs):
     """
     Assign a list of RHSs to a list of Functions.
 
@@ -22,6 +23,9 @@ def assign(f, rhs=0, options=None, name='assign', **kwargs):
         be passed to Eq.
     name : str, optional
         Name of the operator.
+    assign_halo : bool, optional
+        Include the halo region in the assignment (False, default) or restrict it
+        to `f`'s physical domain.
 
     Examples
     --------
@@ -51,6 +55,7 @@ def assign(f, rhs=0, options=None, name='assign', **kwargs):
     """
     if not isinstance(rhs, list):
         rhs = len(as_list(f))*[rhs, ]
+
     eqs = []
     if options:
         for i, j, k in zip(as_list(f), rhs, options):
@@ -61,6 +66,17 @@ def assign(f, rhs=0, options=None, name='assign', **kwargs):
     else:
         for i, j in zip(as_list(f), rhs):
             eqs.append(dv.Eq(i, j))
+
+    if assign_halo:
+        subs = {}
+        for d, h in zip(f.dimensions, f._size_halo):
+            if sum(h) == 0:
+                continue
+            subs[d] = dv.CustomDimension(name=d.name, parent=d,
+                                         symbolic_min=d.symbolic_min - h.left,
+                                         symbolic_max=d.symbolic_max + h.right)
+        eqs = [eq.xreplace(subs) for eq in eqs]
+
     dv.Operator(eqs, name=name, **kwargs)()
 
 
@@ -283,9 +299,7 @@ def initialize_function(function, data, nbl, mapper=None, mode='constant',
             pad_outhalo(function)
         return
 
-    nbl = nbl_to_padsize(nbl, function.ndim)
-    slices = tuple([slice(nl, -nr) for _, (nl, nr) in zip(range(function.grid.dim),
-                                                          as_tuple(nbl))])
+    nbl, slices = nbl_to_padsize(nbl, function.ndim)
     if isinstance(data, dv.Function):
         function.data[slices] = data.data[:]
     else:

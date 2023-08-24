@@ -4,7 +4,7 @@ from collections import OrderedDict
 from os import environ
 from functools import wraps
 
-from devito.logger import warning
+from devito.logger import info, warning
 from devito.tools import Signer, filter_ordered
 
 __all__ = ['configuration', 'init_configuration', 'print_defaults', 'print_state',
@@ -72,15 +72,6 @@ class Parameters(OrderedDict, Signer):
         else:
             return value
 
-    def _updated(self, key, value):
-        """
-        Execute the callback associated to ``key``, if any.
-        """
-        if key in self._update_functions:
-            retval = self._update_functions[key](value)
-            if retval is not None:
-                super(Parameters, self).__setitem__(key, retval)
-
     @_check_key_deprecation
     def __getitem__(self, key, *args):
         return super(Parameters, self).__getitem__(key)
@@ -89,8 +80,10 @@ class Parameters(OrderedDict, Signer):
     @_check_key_value
     def __setitem__(self, key, value):
         value = self._preprocess(key, value)
-        super(Parameters, self).__setitem__(key, value)
-        self._updated(key, value)
+        if key in self._update_functions:
+            value = self._update_functions[key](value)
+        if value is not None:
+            super(Parameters, self).__setitem__(key, value)
 
     @_check_key_deprecation
     @_check_key_value
@@ -232,28 +225,35 @@ def init_configuration(configuration=configuration, env_vars_mapper=env_vars_map
 class switchconfig(object):
 
     """
-    Decorator to temporarily change `configuration` parameters.
+    Decorator or context manager to temporarily change `configuration` parameters.
     """
 
-    def __init__(self, **params):
-        self.params = {k.replace('_', '-'): v for k, v in params.items()}
+    def __init__(self, condition=True, **params):
+        if condition:
+            self.params = {k.replace('_', '-'): v for k, v in params.items()}
+        else:
+            self.params = {}
+        self.previous = {}
+
+    def __enter__(self, condition=True, **params):
+        self.previous = {}
+        for k, v in self.params.items():
+            self.previous[k] = configuration[k]
+            configuration[k] = v
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for k, v in self.params.items():
+            try:
+                configuration[k] = self.previous[k]
+            except ValueError:
+                # E.g., `platform` and `compiler` will end up here
+                super(Parameters, configuration).__setitem__(k, self.previous[k])
 
     def __call__(self, func, *args, **kwargs):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            previous = {}
-            for k, v in self.params.items():
-                previous[k] = configuration[k]
-                configuration[k] = v
-            try:
+            with self:
                 result = func(*args, **kwargs)
-            finally:
-                for k, v in self.params.items():
-                    try:
-                        configuration[k] = previous[k]
-                    except ValueError:
-                        # E.g., `platform` and `compiler` will end up here
-                        configuration[k] = previous[k].name
             return result
         return wrapper
 
@@ -261,7 +261,6 @@ class switchconfig(object):
 def print_defaults():
     """Print the environment variables accepted by Devito, their default value,
     as well as all of the accepted values."""
-    from devito.logger import info
     for k, v in env_vars_mapper.items():
         info('%s: %s. Default: %s' % (k, configuration._accepted[v],
                                       configuration._defaults[v]))
@@ -269,6 +268,5 @@ def print_defaults():
 
 def print_state():
     """Print the current configuration state."""
-    from devito.logger import info
     for k, v in configuration.items():
         info('%s: %s' % (k, v))

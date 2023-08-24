@@ -2,28 +2,32 @@
 
 import abc
 import inspect
-import numbers
 from cached_property import cached_property
 from collections import OrderedDict, namedtuple
 from collections.abc import Iterable
 
 import cgen as c
+from sympy import IndexedBase, sympify
 
 from devito.data import FULL
-from devito.ir.equations import DummyEq
-from devito.ir.support import (SEQUENTIAL, PARALLEL, PARALLEL_IF_ATOMIC,
-                               PARALLEL_IF_PVT, VECTORIZED, AFFINE, COLLAPSED,
-                               Property, Forward, detect_io)
-from devito.symbolics import ListInitializer, FunctionFromPointer, as_symbol, ccode
-from devito.tools import Signer, as_tuple, filter_ordered, filter_sorted, flatten
-from devito.types.basic import AbstractFunction, Indexed, LocalObject, Symbol
+from devito.ir.equations import DummyEq, OpInc, OpMin, OpMax
+from devito.ir.support import (INBOUND, SEQUENTIAL, PARALLEL, PARALLEL_IF_ATOMIC,
+                               PARALLEL_IF_PVT, VECTORIZED, AFFINE, Property,
+                               Forward, detect_io)
+from devito.symbolics import ListInitializer, CallFromPointer, ccode
+from devito.tools import (Signer, as_tuple, filter_ordered, filter_sorted, flatten,
+                          ctypes_to_cstr)
+from devito.types.basic import (AbstractFunction, AbstractSymbol, Basic, Indexed,
+                                Symbol)
+from devito.types.object import AbstractObject, LocalObject
 
-__all__ = ['Node', 'Block', 'Expression', 'Element', 'Callable', 'Call', 'Conditional',
-           'Iteration', 'List', 'LocalExpression', 'Section', 'TimedList', 'Prodder',
-           'MetaCall', 'PointerCast', 'ForeignExpression', 'HaloSpot', 'IterationTree',
-           'ExpressionBundle', 'AugmentedExpression', 'Increment', 'Return', 'While',
-           'ParallelIteration', 'ParallelBlock', 'Dereference', 'Lambda', 'SyncSpot',
-           'PragmaList', 'DummyExpr', 'BlankLine', 'ParallelTree']
+__all__ = ['Node', 'Block', 'Expression', 'Callable', 'Call',
+           'Conditional', 'Iteration', 'List', 'Section', 'TimedList', 'Prodder',
+           'MetaCall', 'PointerCast', 'HaloSpot', 'Definition', 'ExpressionBundle',
+           'AugmentedExpression', 'Increment', 'Return', 'While',
+           'ParallelIteration', 'ParallelBlock', 'Dereference', 'Lambda',
+           'SyncSpot', 'Pragma', 'DummyExpr', 'BlankLine', 'ParallelTree',
+           'BusyWait', 'CallableBody', 'Transfer']
 
 # First-class IET nodes
 
@@ -32,28 +36,22 @@ class Node(Signer):
 
     __metaclass__ = abc.ABCMeta
 
-    is_Node = True
     is_Block = False
     is_Iteration = False
-    is_IterationFold = False
     is_While = False
     is_Expression = False
-    is_Increment = False
-    is_ForeignExpression = False
-    is_LocalExpression = False
     is_Callable = False
-    is_Lambda = False
+    is_CallableBody = False
+    is_Conditional = False
     is_ElementalFunction = False
     is_Call = False
     is_List = False
+    is_Definition = False
     is_PointerCast = False
     is_Dereference = False
-    is_Element = False
     is_Section = False
     is_HaloSpot = False
     is_ExpressionBundle = False
-    is_ParallelIteration = False
-    is_ParallelBlock = False
     is_SyncSpot = False
 
     _traversable = []
@@ -61,6 +59,12 @@ class Node(Signer):
     :attr:`_traversable`. The traversable fields of the Node; that is, fields
     walked over by a Visitor. All arguments in __init__ whose name
     appears in this list are treated as traversable fields.
+    """
+
+    _ccode_handler = None
+    """
+    Customizable by subclasses, in particular Operator subclasses which define
+    backend-specific nodes and, as such, require node-specific handlers.
     """
 
     def __new__(cls, *args, **kwargs):
@@ -123,20 +127,28 @@ class Node(Signer):
     def __str__(self):
         return str(self.ccode)
 
-    @abc.abstractproperty
+    def __repr__(self):
+        return self.__class__.__name__
+
+    @property
     def functions(self):
         """All AbstractFunction objects used by this node."""
-        raise NotImplementedError()
+        return ()
 
-    @abc.abstractproperty
-    def free_symbols(self):
-        """All Symbol objects used by this node."""
-        raise NotImplementedError()
+    @property
+    def expr_symbols(self):
+        """All symbols appearing in an expression within this node."""
+        return ()
 
-    @abc.abstractproperty
+    @property
     def defines(self):
-        """All Symbol objects defined by this node."""
-        raise NotImplementedError()
+        """All Basic objects defined by this node."""
+        return ()
+
+    @property
+    def writes(self):
+        """All Basic objects modified by this node."""
+        return ()
 
     def _signature_items(self):
         return (str(self.ccode),)
@@ -173,7 +185,7 @@ class List(Node):
 
     def __init__(self, header=None, body=None, footer=None):
         body = as_tuple(body)
-        if len(body) == 1 and all(type(i) == List for i in [self, body[0]]):
+        if len(body) == 1 and all(type(i) is List for i in [self, body[0]]):
             # De-nest Lists
             #
             # Note: to avoid disgusting metaclass voodoo (due to
@@ -193,18 +205,6 @@ class List(Node):
         return "<%s (%d, %d, %d)>" % (self.__class__.__name__, len(self.header),
                                       len(self.body), len(self.footer))
 
-    @property
-    def functions(self):
-        return ()
-
-    @property
-    def free_symbols(self):
-        return ()
-
-    @property
-    def defines(self):
-        return ()
-
 
 class Block(List):
 
@@ -218,24 +218,6 @@ class Block(List):
         self.footer = as_tuple(footer)
 
 
-class Element(Node):
-
-    """
-    A generic node. Can be a comment, a statement, ... or anything that cannot
-    be expressed through an IET type.
-    """
-
-    is_Element = True
-
-    def __init__(self, element):
-        assert isinstance(element, (c.Comment, c.Statement, c.Value, c.Initializer,
-                                    c.Pragma, c.Line, c.Assign, c.POD))
-        self.element = element
-
-    def __repr__(self):
-        return "Element::\n\t%s" % (self.element)
-
-
 class Call(ExprStmt, Node):
 
     """
@@ -243,7 +225,7 @@ class Call(ExprStmt, Node):
 
     Parameters
     ----------
-    name : str or FunctionFromPointer
+    name : str or CallFromPointer
         The called function.
     arguments : list of Basic, optional
         The objects in input to the function call.
@@ -253,12 +235,21 @@ class Call(ExprStmt, Node):
         If True, the object represents an indirect function call. The emitted
         code will be `name, arg1, ..., argN` rather than `name(arg1, ..., argN)`.
         Defaults to False.
+    cast : bool, optional
+        If True, the Call return value is explicitly casted to the `retobj` type.
+        Defaults to False.
+    writes : list, optional
+        The AbstractFunctions that will be written to by the called function.
+        Explicitly tagging these AbstractFunctions is useful in the case of external
+        calls, that is whenever the compiler would be unable to retrieve that
+        information by analysis of the IET graph.
     """
 
     is_Call = True
 
-    def __init__(self, name, arguments=None, retobj=None, is_indirect=False):
-        if isinstance(name, FunctionFromPointer):
+    def __init__(self, name, arguments=None, retobj=None, is_indirect=False,
+                 cast=False, writes=None):
+        if isinstance(name, CallFromPointer):
             self.base = name.base
         else:
             self.base = None
@@ -266,54 +257,84 @@ class Call(ExprStmt, Node):
         self.arguments = as_tuple(arguments)
         self.retobj = retobj
         self.is_indirect = is_indirect
+        self.cast = cast
+        self._writes = as_tuple(writes)
 
     def __repr__(self):
         ret = "" if self.retobj is None else "%s = " % self.retobj
         return "%sCall::\n\t%s(...)" % (ret, self.name)
 
     @property
-    def functions(self):
-        retval = [i.function for i in self.arguments
-                  if isinstance(i, (AbstractFunction, Indexed, LocalObject))]
-        if self.base is not None:
-            retval.append(self.base.function)
-        if self.retobj is not None:
-            retval.append(self.retobj.function)
-        return tuple(retval)
-
-    @property
     def children(self):
         return tuple(i for i in self.arguments if isinstance(i, (Call, Lambda)))
 
     @cached_property
-    def free_symbols(self):
-        free = set()
+    def functions(self):
+        retval = []
         for i in self.arguments:
-            if isinstance(i, numbers.Number):
-                continue
-            elif isinstance(i, AbstractFunction):
-                if i.is_ArrayBasic:
-                    free.add(i)
-                else:
-                    # Always passed by _C_name since what actually needs to be
-                    # provided is the pointer to the corresponding C struct
-                    free.add(i._C_symbol)
+            if isinstance(i, (AbstractFunction, Indexed, IndexedBase, AbstractObject)):
+                retval.append(i.function)
+            elif isinstance(i, Call):
+                retval.extend(i.functions)
             else:
-                free.update(i.free_symbols)
+                try:
+                    v = i.free_symbols
+                except AttributeError:
+                    continue
+                for s in v:
+                    try:
+                        # `try-except` necessary for e.g. Macro
+                        if isinstance(s.function, (AbstractFunction, AbstractObject)):
+                            retval.append(s.function)
+                    except AttributeError:
+                        continue
+
         if self.base is not None:
-            free.add(self.base)
+            retval.append(self.base.function)
+
         if self.retobj is not None:
-            free.update(self.retobj.free_symbols)
-        return free
+            retval.append(self.retobj.function)
+
+        return tuple(filter_ordered(retval))
+
+    @cached_property
+    def expr_symbols(self):
+        retval = []
+        for i in self.arguments:
+            if isinstance(i, AbstractFunction):
+                continue
+            elif isinstance(i, (Indexed, IndexedBase, AbstractObject, Symbol)):
+                retval.extend(i.free_symbols)
+            elif isinstance(i, Call):
+                retval.extend(i.expr_symbols)
+            else:
+                try:
+                    retval.extend(i.free_symbols)
+                except AttributeError:
+                    pass
+
+        if self.base is not None:
+            retval.append(self.base)
+
+        if isinstance(self.retobj, Indexed):
+            retval.extend(self.retobj.free_symbols)
+        elif self.retobj is not None:
+            retval.append(self.retobj)
+
+        return tuple(filter_ordered(retval))
 
     @property
     def defines(self):
         ret = ()
         if self.base is not None:
             ret += (self.base,)
-        if self.retobj is not None:
+        if isinstance(self.retobj, Basic):
             ret += (self.retobj,)
         return ret
+
+    @property
+    def writes(self):
+        return self._writes
 
 
 class Expression(ExprStmt, Node):
@@ -327,29 +348,23 @@ class Expression(ExprStmt, Node):
         The encapsulated expression.
     pragmas : cgen.Pragma or list of cgen.Pragma, optional
         A bag of pragmas attached to this Expression.
+    init : bool, optional
+        True if an initialization, False otherwise (default).
+    operation : Operation, optional
+        Special operation performed by the Expression (e.g., a reduction).
     """
 
     is_Expression = True
 
-    def __init__(self, expr, pragmas=None):
-        self.__expr_finalize__(expr, pragmas)
-
-    def __expr_finalize__(self, expr, pragmas):
-        """Finalize the Expression initialization."""
-        self._expr = expr
-        self._pragmas = as_tuple(pragmas)
+    def __init__(self, expr, pragmas=None, init=False, operation=None):
+        self.expr = expr
+        self.pragmas = as_tuple(pragmas)
+        self.init = init
+        self.operation = operation
 
     def __repr__(self):
         return "<%s::%s>" % (self.__class__.__name__,
                              filter_ordered([f.func for f in self.functions]))
-
-    @property
-    def expr(self):
-        return self._expr
-
-    @property
-    def pragmas(self):
-        return self._pragmas
 
     @property
     def dtype(self):
@@ -377,28 +392,33 @@ class Expression(ExprStmt, Node):
 
     @property
     def is_scalar(self):
-        """True if a scalar expression, False otherwise."""
-        return self.expr.lhs.is_Symbol
+        """True if the LHS is a scalar, False otherwise."""
+        return isinstance(self.expr.lhs, (AbstractSymbol, IndexedBase, LocalObject))
 
     @property
     def is_tensor(self):
-        """True if a tensor expression, False otherwise."""
-        return not self.is_scalar
+        """True if the LHS is an array entry, False otherwise."""
+        return self.expr.lhs.is_Indexed
 
     @property
-    def is_definition(self):
+    def is_reduction(self):
+        """True if the RHS performs a reduction operation, False otherwise."""
+        return self.operation in (OpInc, OpMin, OpMax)
+
+    @property
+    def is_initializable(self):
         """
-        True if it is an assignment, False otherwise
+        True if it can be an initializing assignment, False otherwise.
         """
-        return ((self.is_scalar and not self.is_Increment) or
+        return ((self.is_scalar and not self.is_reduction) or
                 (self.is_tensor and isinstance(self.expr.rhs, ListInitializer)))
 
     @property
     def defines(self):
-        return (self.write,) if self.is_definition else ()
+        return (self.output.base,) if self.is_initializable else ()
 
     @property
-    def free_symbols(self):
+    def expr_symbols(self):
         return tuple(self.expr.free_symbols)
 
     @cached_property
@@ -408,16 +428,30 @@ class Expression(ExprStmt, Node):
             functions.append(self.write)
         return tuple(filter_ordered(functions))
 
+    @property
+    def writes(self):
+        return (self.write,)
+
 
 class AugmentedExpression(Expression):
 
     """A node representing an augmented assignment, such as +=, -=, &=, ...."""
 
-    is_Increment = True
+    def __init__(self, expr, pragmas=None, operation=None):
+        super().__init__(expr, pragmas=pragmas, operation=operation)
 
-    def __init__(self, expr, op, pragmas=None):
-        super(AugmentedExpression, self).__init__(expr, pragmas=pragmas)
-        self.op = op
+    @property
+    def is_initializable(self):
+        return False
+
+    @property
+    def op(self):
+        try:
+            return self.operation.name
+        except AttributeError:
+            # Not an ir.Operation
+            assert not self.is_reduction
+            return self.operation
 
 
 class Increment(AugmentedExpression):
@@ -425,7 +459,7 @@ class Increment(AugmentedExpression):
     """Shortcut for ``AugmentedExpression(expr, '+'), since it's so widely used."""
 
     def __init__(self, expr, pragmas=None):
-        super(Increment, self).__init__(expr, '+', pragmas=pragmas)
+        super().__init__(expr, pragmas=pragmas, operation=OpInc)
 
 
 class Iteration(Node):
@@ -516,6 +550,10 @@ class Iteration(Node):
         return PARALLEL_IF_PVT in self.properties
 
     @property
+    def is_ParallelNoAtomic(self):
+        return any([self.is_Parallel, self.is_ParallelPrivate])
+
+    @property
     def is_ParallelRelaxed(self):
         return any([self.is_Parallel, self.is_ParallelAtomic, self.is_ParallelPrivate])
 
@@ -524,28 +562,13 @@ class Iteration(Node):
         return VECTORIZED in self.properties
 
     @property
-    def ncollapsed(self):
-        for i in self.properties:
-            if i.name == 'collapsed':
-                return i.val
-        return 0
+    def is_Inbound(self):
+        return INBOUND in self.properties
 
     @property
     def symbolic_bounds(self):
         """A 2-tuple representing the symbolic bounds [min, max] of the Iteration."""
-        _min = self.limits[0]
-        _max = self.limits[1]
-        try:
-            _min = as_symbol(_min)
-        except TypeError:
-            # A symbolic expression
-            pass
-        try:
-            _max = as_symbol(_max)
-        except TypeError:
-            # A symbolic expression
-            pass
-        return (_min, _max)
+        return (sympify(self.limits[0]), sympify(self.limits[1]))
 
     @property
     def symbolic_size(self):
@@ -583,13 +606,12 @@ class Iteration(Node):
         return _max - _min + 1
 
     @property
-    def functions(self):
-        """All Functions appearing in the Iteration header."""
-        return ()
+    def dimensions(self):
+        """All Dimensions appearing in the Iteration header."""
+        return tuple(self.dim._defines) + self.uindices
 
-    @property
-    def free_symbols(self):
-        """All Symbols appearing in the Iteration header."""
+    @cached_property
+    def expr_symbols(self):
         return tuple(self.symbolic_min.free_symbols) \
             + tuple(self.symbolic_max.free_symbols) \
             + self.uindices \
@@ -598,21 +620,34 @@ class Iteration(Node):
 
     @property
     def defines(self):
-        """All Symbols defined in the Iteration header."""
         return self.dimensions
 
-    @property
-    def dimensions(self):
-        """All Dimensions appearing in the Iteration header."""
-        return tuple(self.dim._defines) + self.uindices
+
+class DoIf(Node):
+
+    """
+    An abstract Node to express computation subjected to a condition.
+    """
+
+    def __init__(self, condition):
+        self.condition = condition
 
     @property
-    def write(self):
-        """All Functions written to in this Iteration"""
-        return []
+    def functions(self):
+        ret = []
+        for i in self.condition.free_symbols:
+            try:
+                ret.append(i.function)
+            except AttributeError:
+                pass
+        return tuple(ret)
+
+    @property
+    def expr_symbols(self):
+        return tuple(self.condition.free_symbols)
 
 
-class While(Node):
+class While(DoIf):
 
     """
     Implement a while-loop.
@@ -630,7 +665,7 @@ class While(Node):
     _traversable = ['body']
 
     def __init__(self, condition, body=None):
-        self.condition = condition
+        super().__init__(condition)
         self.body = as_tuple(body)
 
     def __repr__(self):
@@ -649,43 +684,119 @@ class Callable(Node):
     body : Node or list of Node
         The Callable body.
     retval : str
-        The return type of Callable.
+        The return type of the Callable.
     parameters : list of Basic, optional
         The objects in input to the Callable.
     prefix : list of str, optional
-        Qualifiers to prepend to the Callable signature. Defaults to ``('static',
-        'inline')``.
+        Qualifiers to prepend to the Callable signature. None by defaults.
+    templates : list of Basic, optional
+        The template parameters of the Callable.
     """
 
     is_Callable = True
 
     _traversable = ['body']
 
-    def __init__(self, name, body, retval, parameters=None, prefix=('static', 'inline')):
+    def __init__(self, name, body, retval, parameters=None, prefix=None,
+                 templates=None):
         self.name = name
-        self.body = as_tuple(body)
+        if not isinstance(body, CallableBody):
+            self.body = CallableBody(body)
+        else:
+            self.body = body
         self.retval = retval
         self.prefix = as_tuple(prefix)
         self.parameters = as_tuple(parameters)
+        self.templates = as_tuple(templates)
 
     def __repr__(self):
+        param_types = [ctypes_to_cstr(i._C_ctype) for i in self.parameters]
         return "%s[%s]<%s; %s>" % (self.__class__.__name__, self.name, self.retval,
-                                   ",".join([i._C_typename for i in self.parameters]))
+                                   ",".join(param_types))
+
+    @property
+    def all_parameters(self):
+        return self.parameters + self.templates
 
     @property
     def functions(self):
-        return tuple(i for i in self.parameters if isinstance(i, AbstractFunction))
-
-    @property
-    def free_symbols(self):
-        return ()
+        return tuple(i.function for i in self.all_parameters
+                     if isinstance(i.function, AbstractFunction))
 
     @property
     def defines(self):
-        return ()
+        return self.all_parameters
 
 
-class Conditional(Node):
+class CallableBody(Node):
+
+    """
+    The immediate child of a Callable.
+
+    Parameters
+    ----------
+    body : Node or list of Node
+        The actual body.
+    unpacks : list of Nodes, optional
+        Statements unpacking data from composite types.
+    init : Node, optional
+        A piece of IET to perform some initialization relevant for `body`
+        (e.g., to initialize the target language runtime).
+    allocs : list of Nodes, optional
+        Data definitions and allocations for `body`.
+    casts : list of PointerCasts, optional
+        Sequence of PointerCasts required by the `body`.
+    bundles : list of Nodes, optional
+        Data bundling for `body`. Used to initialize data subjected to layout
+        transformation (w.r.t. how it arrives from Python), such as vector types.
+    maps : Transfer or list of Transfer, optional
+        Data maps for `body` (a data map may e.g. trigger a data transfer from
+        host to device).
+    strides : list of Nodes, optional
+        Statements defining symbols used to access linearized arrays.
+    objs : list of Definitions, optional
+        Object definitions for `body`.
+    unmaps : Transfer or list of Transfer, optional
+        Data unmaps for `body`.
+    unbundles : list of Nodes, optional
+        Data unbundling for `body`.
+    frees : list of Calls, optional
+        Data deallocations for `body`.
+    """
+
+    is_CallableBody = True
+
+    _traversable = ['unpacks', 'init', 'allocs', 'casts', 'bundles', 'maps',
+                    'strides', 'objs', 'body', 'unmaps', 'unbundles', 'frees']
+
+    def __init__(self, body, init=(), unpacks=(), strides=(), allocs=(), casts=(),
+                 bundles=(), objs=(), maps=(), unmaps=(), unbundles=(), frees=()):
+        # Sanity check
+        assert not isinstance(body, CallableBody), "CallableBody's cannot be nested"
+
+        self.body = as_tuple(body)
+
+        self.unpacks = as_tuple(unpacks)
+        self.init = as_tuple(init)
+        self.allocs = as_tuple(allocs)
+        self.casts = as_tuple(casts)
+        self.strides = as_tuple(strides)
+        self.bundles = as_tuple(bundles)
+        self.maps = as_tuple(maps)
+        self.objs = as_tuple(objs)
+        self.unmaps = as_tuple(unmaps)
+        self.unbundles = as_tuple(unbundles)
+        self.frees = as_tuple(frees)
+
+    def __repr__(self):
+        return ("<CallableBody <unpacks=%d, allocs=%d, casts=%d, maps=%d, "
+                "objs=%d> <unmaps=%d, frees=%d>>" %
+                (len(self.unpacks), len(self.allocs), len(self.casts),
+                 len(self.maps), len(self.objs), len(self.unmaps),
+                 len(self.frees)))
+
+
+class Conditional(DoIf):
 
     """
     A node to express if-then-else blocks.
@@ -705,7 +816,7 @@ class Conditional(Node):
     _traversable = ['then_body', 'else_body']
 
     def __init__(self, condition, then_body, else_body=None):
-        self.condition = condition
+        super().__init__(condition)
         self.then_body = as_tuple(then_body)
         self.else_body = as_tuple(else_body)
 
@@ -715,24 +826,6 @@ class Conditional(Node):
                 (ccode(self.condition), repr(self.then_body), repr(self.else_body))
         else:
             return "<[%s] ? [%s]" % (ccode(self.condition), repr(self.then_body))
-
-    @property
-    def functions(self):
-        ret = []
-        for i in self.condition.free_symbols:
-            try:
-                ret.append(i.function)
-            except AttributeError:
-                pass
-        return tuple(ret)
-
-    @property
-    def free_symbols(self):
-        return tuple(self.condition.free_symbols)
-
-    @property
-    def defines(self):
-        return ()
 
 
 # Second level IET nodes
@@ -780,22 +873,63 @@ class TimedList(List):
         return self._timer
 
     @property
-    def free_symbols(self):
-        return ()
+    def functions(self):
+        return (self.timer,)
+
+
+class Definition(ExprStmt, Node):
+
+    """
+    A node encapsulating a variable definition.
+    """
+
+    is_Definition = True
+
+    def __init__(self, function):
+        self.function = function
+
+    def __repr__(self):
+        return "<Def(%s)>" % self.function
+
+    @property
+    def functions(self):
+        return (self.function,)
+
+    @property
+    def defines(self):
+        if self.function._mem_stack:
+            return (self.function.indexed,)
+        else:
+            return (self.function,)
+
+    @property
+    def expr_symbols(self):
+        if not self.function.is_Array or self.function.initvalue is None:
+            return ()
+        # These are just a handful of values so it's OK to iterate them over
+        ret = set()
+        for i in self.function.initvalue:
+            try:
+                ret.update(i.free_symbols)
+            except AttributeError:
+                pass
+        return tuple(ret)
 
 
 class PointerCast(ExprStmt, Node):
 
     """
-    A node encapsulating a cast of a raw C pointer to a multi-dimensional array.
+    A node encapsulating a cast of a raw void pointer to a non-void,
+    potentially multi-dimensional array.
     """
 
     is_PointerCast = True
 
-    def __init__(self, function, obj=None, alignment=True):
+    def __init__(self, function, obj=None, alignment=True, flat=None):
         self.function = function
         self.obj = obj
         self.alignment = alignment
+        self.flat = flat
 
     def __repr__(self):
         return "<PointerCast(%s)>" % self.function
@@ -816,21 +950,19 @@ class PointerCast(ExprStmt, Node):
         return (self.function,)
 
     @property
-    def free_symbols(self):
-        """
-        The symbols required by the PointerCast.
-
-        This may include DiscreteFunctions as well as Dimensions.
-        """
+    def expr_symbols(self):
         f = self.function
-        if f.is_ArrayBasic:
+        if not self.flat and f.is_ArrayBasic:
             return tuple(flatten(s.free_symbols for s in f.symbolic_shape[1:]))
         else:
             return ()
 
     @property
     def defines(self):
-        return ()
+        if isinstance(self.obj, IndexedBase):
+            return (self.obj,)
+        else:
+            return (self.function.indexed,)
 
 
 class Dereference(ExprStmt, Node):
@@ -839,16 +971,17 @@ class Dereference(ExprStmt, Node):
     A node encapsulating a dereference from a `pointer` to a `pointee`.
     The following cases are supported:
 
-        * `pointer` is a PointerArray and `pointee` is an Array (typical case).
-        * `pointer` is an ArrayObject representing a pointer to a C struct while
+        * `pointer` is a PointerArray or TempFunction, and `pointee` is an Array.
+        * `pointer` is an ArrayObject representing a pointer to a C struct, and
           `pointee` is a field in `pointer`.
     """
 
     is_Dereference = True
 
-    def __init__(self, pointee, pointer):
+    def __init__(self, pointee, pointer, flat=None):
         self.pointee = pointee
         self.pointer = pointer
+        self.flat = flat
 
     def __repr__(self):
         return "<Dereference(%s,%s)>" % (self.pointee, self.pointer)
@@ -858,70 +991,24 @@ class Dereference(ExprStmt, Node):
         return (self.pointee, self.pointer)
 
     @property
-    def free_symbols(self):
-        return ((self.pointee.indexed.label, self.pointer.indexed.label) +
-                tuple(flatten(i.free_symbols for i in self.pointee.symbolic_shape[1:])) +
-                tuple(self.pointer.free_symbols))
-
-    @property
-    def defines(self):
-        return (self.pointee,)
-
-
-class LocalExpression(Expression):
-
-    """
-    A node encapsulating a SymPy equation which also defines its LHS.
-    """
-
-    is_LocalExpression = True
-
-    @cached_property
-    def write(self):
-        return self.expr.lhs.function
-
-    @property
-    def defines(self):
-        return (self.write, )
-
-
-class ForeignExpression(Expression):
-
-    """A node representing a SymPy FunctionFromPointer expression."""
-
-    is_ForeignExpression = True
-
-    def __init__(self, expr, dtype, **kwargs):
-        self._dtype = dtype
-        self._is_increment = kwargs.get('is_Increment', False)
-        self.__expr_finalize__(expr)
-
-    @property
-    def dtype(self):
-        return self._dtype
-
-    @property
-    def output(self):
-        return self.expr.base
-
-    @property
-    def write(self):
-        if isinstance(self.output, (Symbol, Indexed)):
-            return self.output.function
+    def expr_symbols(self):
+        ret = [self.pointer.indexed]
+        if self.pointer.is_PointerArray or self.pointer.is_TempFunction:
+            ret.append(self.pointee.indexed)
+            ret.extend(flatten(i.free_symbols for i in self.pointee.symbolic_shape[1:]))
+            ret.extend(self.pointer.free_symbols)
         else:
-            return None
+            ret.append(self.pointee._C_symbol)
+        return tuple(filter_ordered(ret))
 
     @property
-    def is_Increment(self):
-        return self._is_increment
-
-    @property
-    def is_scalar(self):
-        return False
-
-    @property
-    def is_tensor(self):
-        return False
+    def defines(self):
+        if self.pointer.is_PointerArray or \
+           self.pointer.is_TempFunction or \
+           self.pointee._mem_stack:
+            return (self.pointee.indexed, self.pointee)
+        else:
+            return (self.pointee,)
 
 
 class Lambda(Node):
@@ -946,8 +1033,6 @@ class Lambda(Node):
         The objects in input to the lambda function.
     """
 
-    is_Lambda = True
-
     _traversable = ['body']
 
     def __init__(self, body, captures=None, parameters=None):
@@ -959,12 +1044,8 @@ class Lambda(Node):
         return "Lambda[%s](%s)" % (self.captures, self.parameters)
 
     @cached_property
-    def free_symbols(self):
-        return set(self.parameters)
-
-    @property
-    def defines(self):
-        return ()
+    def expr_symbols(self):
+        return tuple(self.parameters)
 
 
 class Section(List):
@@ -1033,7 +1114,7 @@ class Prodder(Call):
     """
 
     def __init__(self, name, arguments=None, single_thread=False, periodic=False):
-        super(Prodder, self).__init__(name, arguments)
+        super().__init__(name, arguments)
 
         # Prodder properties
         self._single_thread = single_thread
@@ -1048,27 +1129,39 @@ class Prodder(Call):
         return self._periodic
 
 
-class PragmaList(List):
+class Pragma(Node):
 
     """
-    A floating sequence of pragmas.
+    One or more pragmas floating in the IET constructed through a callback.
     """
 
-    def __init__(self, pragmas, functions=None, **kwargs):
-        super().__init__(header=pragmas)
-        self._functions = as_tuple(functions)
+    def __init__(self, callback, arguments=None):
+        super().__init__()
 
-    @property
+        self.callback = callback
+        self.arguments = as_tuple(arguments)
+
+    def __repr__(self):
+        return '<Pragmas>'
+
+    @cached_property
     def pragmas(self):
-        return self.header
+        return as_tuple(self.callback(*self.arguments))
+
+
+class Transfer(object):
+
+    """
+    An interface for Nodes that represent host-device data transfers.
+    """
 
     @property
-    def functions(self):
-        return self._functions
+    def function(self):
+        raise NotImplementedError
 
     @property
-    def free_symbols(self):
-        return self._functions
+    def imask(self):
+        raise NotImplementedError
 
 
 class ParallelIteration(Iteration):
@@ -1077,60 +1170,7 @@ class ParallelIteration(Iteration):
     Implement a parallel for-loop.
     """
 
-    is_ParallelIteration = True
-
-    def __init__(self, *args, **kwargs):
-        pragmas, kwargs, properties = self._make_header(**kwargs)
-        super().__init__(*args, pragmas=pragmas, properties=properties, **kwargs)
-
-    @classmethod
-    def _make_header(cls, **kwargs):
-        construct = cls._make_construct(**kwargs)
-        clauses = cls._make_clauses(**kwargs)
-        header = c.Pragma(' '.join([construct] + clauses))
-
-        # Extract the Iteration Properties
-        properties = cls._process_properties(**kwargs)
-
-        # Drop the unrecognised or unused kwargs
-        kwargs = cls._process_kwargs(**kwargs)
-
-        return (header,), kwargs, properties
-
-    @classmethod
-    def _make_construct(cls, **kwargs):
-        # To be overridden by subclasses
-        raise NotImplementedError
-
-    @classmethod
-    def _make_clauses(cls, **kwargs):
-        return []
-
-    @classmethod
-    def _process_properties(cls, **kwargs):
-        properties = as_tuple(kwargs.get('properties'))
-        properties += (COLLAPSED(kwargs.get('ncollapse', 1)),)
-
-        return properties
-
-    @classmethod
-    def _process_kwargs(cls, **kwargs):
-        kwargs.pop('pragmas', None)
-        kwargs.pop('properties', None)
-
-        # Recognised clauses
-        kwargs.pop('ncollapse', None)
-        kwargs.pop('reduction', None)
-
-        return kwargs
-
-    @cached_property
-    def collapsed(self):
-        ret = [self]
-        for i in range(self.ncollapsed - 1):
-            ret.append(ret[i].nodes[0])
-        assert all(i.is_Iteration for i in ret)
-        return tuple(ret)
+    pass
 
 
 class ParallelTree(List):
@@ -1174,6 +1214,10 @@ class ParallelTree(List):
         return as_tuple(self.nthreads)
 
     @property
+    def expr_symbols(self):
+        return as_tuple(self.nthreads)
+
+    @property
     def root(self):
         return self.body[0]
 
@@ -1183,8 +1227,6 @@ class ParallelBlock(Block):
     """
     A sequence of Nodes, wrapped in a parallel block {...}.
     """
-
-    is_ParallelBlock = True
 
     def __init__(self, body, private=None):
         # Normalize and sanity-check input. A bit ugly, but it makes everything
@@ -1226,6 +1268,15 @@ class ParallelBlock(Block):
         return self.partree.collapsed
 
 
+class BusyWait(While):
+
+    """
+    A while-loop implementing a busy waiting.
+    """
+
+    pass
+
+
 class SyncSpot(List):
 
     """
@@ -1252,12 +1303,17 @@ class CBlankLine(List):
         return ""
 
 
-def DummyExpr(*args):
-    return Expression(DummyEq(*args))
+class Return(Node):
+
+    def __init__(self, value=None):
+        self.value = value
+
+
+def DummyExpr(*args, init=False):
+    return Expression(DummyEq(*args), init=init)
 
 
 BlankLine = CBlankLine()
-Return = lambda i='': Element(c.Statement('return%s' % ((' %s' % i) if i else i)))
 
 
 # Nodes required for distributed-memory halo exchange
@@ -1274,9 +1330,9 @@ class HaloSpot(Node):
 
     _traversable = ['body']
 
-    def __init__(self, halo_scheme, body=None):
+    def __init__(self, body, halo_scheme):
         super(HaloSpot, self).__init__()
-        self._halo_scheme = halo_scheme
+
         if isinstance(body, Node):
             self._body = body
         elif isinstance(body, (list, tuple)) and len(body) == 1:
@@ -1285,6 +1341,8 @@ class HaloSpot(Node):
             self._body = List()
         else:
             raise ValueError("`body` is expected to be a single Node")
+
+        self._halo_scheme = halo_scheme
 
     def __repr__(self):
         functions = "(%s)" % ",".join(i.name for i in self.functions)
@@ -1322,42 +1380,8 @@ class HaloSpot(Node):
     def functions(self):
         return tuple(self.fmapper)
 
-    @property
-    def free_symbols(self):
-        return ()
-
-    @property
-    def defines(self):
-        return ()
-
 
 # Utility classes
-
-
-class IterationTree(tuple):
-
-    """
-    Represent a sequence of nested Iterations.
-    """
-
-    @property
-    def root(self):
-        return self[0] if self else None
-
-    @property
-    def inner(self):
-        return self[-1] if self else None
-
-    @property
-    def dimensions(self):
-        return [i.dim for i in self]
-
-    def __repr__(self):
-        return "IterationTree%s" % super(IterationTree, self).__repr__()
-
-    def __getitem__(self, key):
-        ret = super(IterationTree, self).__getitem__(key)
-        return IterationTree(ret) if isinstance(key, slice) else ret
 
 
 MetaCall = namedtuple('MetaCall', 'root local')

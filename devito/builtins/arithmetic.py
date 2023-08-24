@@ -4,7 +4,22 @@ import devito as dv
 from devito.builtins.utils import MPIReduction
 
 
-__all__ = ['norm', 'sumall', 'inner', 'mmin', 'mmax']
+__all__ = ['norm', 'sumall', 'sum', 'inner', 'mmin', 'mmax']
+
+accumulator_mapper = {
+    # Integer accumulates on Float64
+    np.int8: np.float64, np.uint8: np.float64,
+    np.int16: np.float64, np.uint16: np.float64,
+    np.int32: np.float64, np.uint32: np.float64,
+    np.int64: np.float64, np.uint64: np.float64,
+    # FloatX accumulates on Float2X
+    np.float16: np.float32,
+    np.float32: np.float64,
+    # NOTE: np.float128 isn't really a thing, see for example
+    # https://github.com/numpy/numpy/issues/10288
+    # https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html#1070
+    np.float64: np.float64
+}
 
 
 @dv.switchconfig(log_level='ERROR')
@@ -28,11 +43,11 @@ def norm(f, order=2):
     # otherwise we would eventually be summing more than expected
     p, eqns = f.guard() if f.is_SparseFunction else (f, [])
 
-    s = dv.types.Symbol(name='sum', dtype=f.dtype)
+    dtype = accumulator_mapper[f.dtype]
+    s = dv.types.Symbol(name='sum', dtype=dtype)
 
-    with MPIReduction(f) as mr:
-        op = dv.Operator([dv.Eq(s, 0.0)] +
-                         eqns +
+    with MPIReduction(f, dtype=dtype) as mr:
+        op = dv.Operator([dv.Eq(s, 0.0)] + eqns +
                          [dv.Inc(s, dv.Abs(Pow(p, order))), dv.Eq(mr.n[0], s)],
                          name='norm%d' % order)
         op.apply(**kwargs)
@@ -42,6 +57,60 @@ def norm(f, order=2):
     return f.dtype(v)
 
 
+@dv.switchconfig(log_level='ERROR')
+def sum(f, dims=None):
+    """
+    Compute the sum of the Function data over specified dimensions.
+    Defaults to sum over all dimensions
+
+    Parameters
+    ----------
+    f : Function
+        Input Function.
+    dims : Dimension or tuple of Dimension
+        Dimensions to sum over.
+    """
+    dims = dv.tools.as_tuple(dims)
+    if dims == () or dims == f.dimensions:
+        return sumall(f)
+
+    # Get dimensions and shape of the result
+    new_dims = tuple(d for d in f.dimensions if d not in dims)
+    shape = tuple(f._size_domain[d] for d in new_dims)
+    if f.is_TimeFunction and f.time_dim not in dims:
+        out = f._rebuild(name="%ssum" % f.name, shape=shape, dimensions=new_dims,
+                         initializer=np.empty(0))
+    elif f.is_SparseTimeFunction:
+        if f.time_dim in dims:
+            # Sum over time -> SparseFunction
+            new_coords = f.coordinates._rebuild(
+                name="%ssum_coords" % f.name, initializer=f.coordinates.initializer
+            )
+            out = dv.SparseFunction(name="%ssum" % f.name, grid=f.grid,
+                                    dimensions=new_dims, npoint=f.shape[1],
+                                    coordinates=new_coords)
+        else:
+            # Sum over rec -> TimeFunction
+            out = dv.TimeFunction(name="%ssum" % f.name, grid=f.grid, shape=shape,
+                                  dimensions=new_dims, space_order=0,
+                                  time_order=f.time_order)
+    else:
+        out = dv.Function(name="%ssum" % f.name, grid=f.grid,
+                          space_order=f.space_order, shape=shape,
+                          dimensions=new_dims)
+
+    kwargs = {}
+    if f.is_TimeFunction and f._time_buffering:
+        kwargs[f.time_dim.max_name] = f._time_size - 1
+
+    # Only need one guard as they have the same coordinates and Dimension
+    p, eqns = f.guard() if f.is_SparseFunction else (f, [])
+    op = dv.Operator(eqns + [dv.Eq(out, out + p)])
+    op(**kwargs)
+    return out
+
+
+@dv.switchconfig(log_level='ERROR')
 def sumall(f):
     """
     Compute the sum of all Function data.
@@ -59,11 +128,11 @@ def sumall(f):
     # otherwise we would eventually be summing more than expected
     p, eqns = f.guard() if f.is_SparseFunction else (f, [])
 
-    s = dv.types.Symbol(name='sum', dtype=f.dtype)
+    dtype = accumulator_mapper[f.dtype]
+    s = dv.types.Symbol(name='sum', dtype=dtype)
 
-    with MPIReduction(f) as mr:
-        op = dv.Operator([dv.Eq(s, 0.0)] +
-                         eqns +
+    with MPIReduction(f, dtype=dtype) as mr:
+        op = dv.Operator([dv.Eq(s, 0.0)] + eqns +
                          [dv.Inc(s, p), dv.Eq(mr.n[0], s)],
                          name='sum')
         op.apply(**kwargs)
@@ -71,6 +140,7 @@ def sumall(f):
     return f.dtype(mr.v)
 
 
+@dv.switchconfig(log_level='ERROR')
 def inner(f, g):
     """
     Inner product of two Functions.
@@ -113,11 +183,11 @@ def inner(f, g):
     # otherwise we would eventually be summing more than expected
     rhs, eqns = f.guard(f*g) if f.is_SparseFunction else (f*g, [])
 
-    s = dv.types.Symbol(name='sum', dtype=f.dtype)
+    dtype = accumulator_mapper[f.dtype]
+    s = dv.types.Symbol(name='sum', dtype=dtype)
 
-    with MPIReduction(f, g) as mr:
-        op = dv.Operator([dv.Eq(s, 0.0)] +
-                         eqns +
+    with MPIReduction(f, g, dtype=dtype) as mr:
+        op = dv.Operator([dv.Eq(s, 0.0)] + eqns +
                          [dv.Inc(s, rhs), dv.Eq(mr.n[0], s)],
                          name='inner')
         op.apply(**kwargs)
@@ -125,6 +195,7 @@ def inner(f, g):
     return f.dtype(mr.v)
 
 
+@dv.switchconfig(log_level='ERROR')
 def mmin(f):
     """
     Retrieve the minimum.
@@ -144,6 +215,7 @@ def mmin(f):
         raise ValueError("Expected Function, not `%s`" % type(f))
 
 
+@dv.switchconfig(log_level='ERROR')
 def mmax(f):
     """
     Retrieve the maximum.

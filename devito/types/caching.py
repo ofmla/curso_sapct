@@ -4,8 +4,10 @@ import weakref
 import sympy
 from sympy.core import cache
 
+from devito.tools import safe_dict_copy
 
-__all__ = ['Cached', '_SymbolCache', 'CacheManager']
+
+__all__ = ['Cached', 'Uncached', '_SymbolCache', 'CacheManager']
 
 _SymbolCache = {}
 """The symbol cache."""
@@ -17,6 +19,17 @@ class AugmentedWeakRef(weakref.ref):
         obj = super().__new__(cls, obj)
         obj.nbytes = meta.get('nbytes', 0)
         return obj
+
+
+class Uncached(object):
+
+    """
+    Mixin class for unique, and therefore uncached, symbolic objects
+    (e.g., data carriers).
+    """
+
+    def __hash__(self):
+        return id(self)
 
 
 class Cached(object):
@@ -54,12 +67,17 @@ class Cached(object):
         -------
         The object if in the cache and alive, otherwise None.
         """
-        if key in _SymbolCache:
+
+        # Thread safe against concurrent deletion
+        obj_cached = _SymbolCache.get(key)
+
+        if obj_cached is not None:
             # There is indeed an object mapped to `key`. But is it still alive?
-            obj = _SymbolCache[key]()
+            obj = obj_cached()
             if obj is None:
                 # Cleanup _SymbolCache (though practically unnecessary)
-                del _SymbolCache[key]
+                # does not fail if it's already gone
+                _SymbolCache.pop(key, None)
                 return None
             else:
                 return obj
@@ -85,17 +103,22 @@ class Cached(object):
         for i in (key,) + aliases:
             _SymbolCache[i] = awr
 
-    def __init_cached__(self, key):
+    def __init_cached__(self, cached_obj):
         """
         Initialise `self` with a cached object state.
 
+        "obj" must have been returned, non-None, from _cache_get
+
         Parameters
         ----------
-        key : object
-            The cache key of the object whose state is used to initialize `self`.
-            It must be hashable.
+        cached_obj: object
+            This is expected to be the non-None return value of _cache_get.
+
+            By making a single dictionary lookup we are making things thread-safe
+            by not relying on the cache having not changed between _cache_get and
+            this call.
         """
-        self.__dict__ = _SymbolCache[key]().__dict__.copy()
+        self.__dict__ = cached_obj.__dict__.copy()
 
     def __hash__(self):
         """
@@ -149,13 +172,17 @@ class CacheManager(object):
         sympy.polys.fields._field_cache.clear()
         sympy.polys.domains.modularinteger._modular_integer_cache.clear()
 
+        # Take a copy of the dictionary so we can safely iterate over it
+        # even if another thread is making changes
+        cache_copied = safe_dict_copy(_SymbolCache)
+
         # Maybe trigger garbage collection
         if force is False:
             if cls.ncalls_w_force_false + 1 == cls.force_ths:
                 # Case 1: too long since we called gc.collect, let's do it now
                 gc.collect()
                 cls.ncalls_w_force_false = 0
-            elif any(i.nbytes > cls.gc_ths for i in _SymbolCache.values()):
+            elif any(i.nbytes > cls.gc_ths for i in cache_copied.values()):
                 # Case 2: we got big objects in cache, we try to reclaim memory
                 gc.collect()
                 cls.ncalls_w_force_false = 0
@@ -165,6 +192,12 @@ class CacheManager(object):
         else:
             gc.collect()
 
-        for key, obj in list(_SymbolCache.items()):
+        for key in cache_copied:
+            obj = _SymbolCache.get(key)
+            if obj is None:
+                # deleted by another thread since we took the copy
+                continue
             if obj() is None:
-                del _SymbolCache[key]
+                # pop(x, None) does not error if already gone
+                # (key could be removed in another thread since get() above)
+                _SymbolCache.pop(key, None)

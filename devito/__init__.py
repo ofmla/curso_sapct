@@ -21,13 +21,25 @@ from devito.operator import Operator  # noqa
 # Other stuff exposed to the user
 from devito.builtins import *  # noqa
 from devito.data.allocators import *  # noqa
-from devito.mpi import MPI, mpi_registry  # noqa
+from devito.logger import error, warning, info, set_log_level  # noqa
+from devito.mpi import MPI  # noqa
+try:
+    from devito.checkpointing import DevitoCheckpoint, CheckpointOperator  # noqa
+    from pyrevolve import Revolver
+except ImportError:
+    from devito.checkpointing import NoopCheckpoint as DevitoCheckpoint  # noqa
+    from devito.checkpointing import NoopCheckpointOperator as CheckpointOperator  # noqa
+    from devito.checkpointing import NoopRevolver as Revolver  # noqa
 
 # Imports required to initialize Devito
 from devito.arch import compiler_registry, platform_registry
 from devito.core import *   # noqa
-from devito.logger import error, warning, info, logger_registry, set_log_level  # noqa
+from devito.logger import logger_registry, _set_log_level  # noqa
+from devito.mpi.routines import mpi_registry
 from devito.operator import profiler_registry, operator_registry
+
+# Apply monkey-patching while we wait for our patches to be upstreamed and released
+from devito.mpatches import *  # noqa
 
 
 from ._version import get_versions  # noqa
@@ -41,6 +53,7 @@ def reinit_compiler(val):
     """
     configuration['compiler'].__init__(suffix=configuration['compiler'].suffix,
                                        mpi=configuration['mpi'])
+    return val
 
 
 # Setup target platform and compiler
@@ -51,7 +64,7 @@ configuration.add('compiler', 'custom', list(compiler_registry),
 
 # Setup language for shared-memory parallelism
 preprocessor = lambda i: {0: 'C', 1: 'openmp'}.get(i, i)  # Handles DEVITO_OPENMP deprec
-configuration.add('language', 'C', [0, 1, 'C', 'openmp', 'openacc'],
+configuration.add('language', 'C', [0, 1] + list(operator_registry._languages),
                   preprocessor=preprocessor, callback=reinit_compiler, deprecate='openmp')
 
 # MPI mode (0 => disabled, 1 == basic)
@@ -68,7 +81,7 @@ configuration.add('ignore-unknowns', 0, [0, 1], preprocessor=bool, impacts_jit=F
 
 # Setup log level
 configuration.add('log-level', 'INFO', list(logger_registry),
-                  callback=set_log_level, impacts_jit=False)
+                  callback=_set_log_level, impacts_jit=False)
 
 # Escape hatch for custom kernels. The typical use case is as follows: one lets
 # Devito generate code for an Operator; then, once the session is over, the
@@ -85,6 +98,9 @@ configuration.add('safe-math', 0, [0, 1], preprocessor=bool, callback=reinit_com
 
 # Enable/disable automatic padding for allocated data
 configuration.add('autopadding', False, [False, True])
+
+# Select target device
+configuration.add('deviceid', -1, preprocessor=int, impacts_jit=False)
 
 
 def autotune_callback(val):  # noqa

@@ -1,6 +1,7 @@
 from devito import (Eq, Operator, Function, TimeFunction, NODE, Inc, solve,
                     cos, sin, sqrt)
 from examples.seismic import PointSource, Receiver
+from examples.seismic.acoustic.operators import freesurface
 
 
 def second_order_stencil(model, u, v, H0, Hz, qu, qv, forward=True):
@@ -20,10 +21,16 @@ def second_order_stencil(model, u, v, H0, Hz, qu, qv, forward=True):
     stencilp = solve(m * u.dt2 - H0 - qu + damp * udt, unext)
     stencilr = solve(m * v.dt2 - Hz - qv + damp * vdt, vnext)
 
-    first_stencil = Eq(unext, stencilp)
-    second_stencil = Eq(vnext, stencilr)
+    first_stencil = Eq(unext, stencilp, subdomain=model.grid.subdomains['physdomain'])
+    second_stencil = Eq(vnext, stencilr, subdomain=model.grid.subdomains['physdomain'])
 
     stencils = [first_stencil, second_stencil]
+
+    # Add free surface
+    if model.fs:
+        stencils.append(freesurface(model, Eq(unext, stencilp)))
+        stencils.append(freesurface(model, Eq(vnext, stencilr)))
+
     return stencils
 
 
@@ -111,8 +118,12 @@ def Gzz_centered_2d(model, field, costheta, sintheta, space_order):
     order1 = space_order // 2
     Gz = -(sintheta * field.dx(fd_order=order1) +
            costheta * field.dy(fd_order=order1))
-    Gzz = ((Gz * sintheta).dx(fd_order=order1).T +
-           (Gz * costheta).dy(fd_order=order1).T)
+    Gzz = (Gz * costheta).dy(fd_order=order1).T
+
+    # Add rotated derivative if angles are not zero. If angles are
+    # zeros then `0*Gz = 0` and doesn't have any `.dy` ....
+    if sintheta != 0:
+        Gzz += (Gz * sintheta).dx(fd_order=order1).T
     return Gzz
 
 
@@ -601,7 +612,7 @@ def AdjointOperator(model, geometry, space_order=4,
 
 
 def JacobianOperator(model, geometry, space_order=4,
-                     kernel='centered', **kwargs):
+                     **kwargs):
     """
     Construct a Linearized Born operator in a TTI media.
 
@@ -619,11 +630,7 @@ def JacobianOperator(model, geometry, space_order=4,
     """
     dt = model.grid.stepping_dim.spacing
     m = model.m
-    time_order = 1 if kernel == 'staggered' else 2
-    if kernel == 'staggered':
-        stagg_p = stagg_r = NODE
-    else:
-        stagg_p = stagg_r = None
+    time_order = 2
 
     # Create source and receiver symbols
     src = Receiver(name='src', grid=model.grid, time_range=geometry.time_axis,
@@ -633,35 +640,29 @@ def JacobianOperator(model, geometry, space_order=4,
                    npoint=geometry.nrec)
 
     # Create wavefields and a dm field
-    u0 = TimeFunction(name='u0', grid=model.grid, staggered=stagg_p, save=None,
-                      time_order=time_order, space_order=space_order)
-    v0 = TimeFunction(name='v0', grid=model.grid, staggered=stagg_r, save=None,
-                      time_order=time_order, space_order=space_order)
-    du = TimeFunction(name='du', grid=model.grid, staggered=stagg_p, save=None,
-                      time_order=time_order, space_order=space_order)
-    dv = TimeFunction(name='dv', grid=model.grid, staggered=stagg_r, save=None,
-                      time_order=time_order, space_order=space_order)
+    u0 = TimeFunction(name='u0', grid=model.grid, save=None, time_order=time_order,
+                      space_order=space_order)
+    v0 = TimeFunction(name='v0', grid=model.grid, save=None, time_order=time_order,
+                      space_order=space_order)
+    du = TimeFunction(name="du", grid=model.grid, save=None,
+                      time_order=2, space_order=space_order)
+    dv = TimeFunction(name="dv", grid=model.grid, save=None,
+                      time_order=2, space_order=space_order)
     dm = Function(name="dm", grid=model.grid, space_order=0)
 
     # FD kernels of the PDE
-    FD_kernel = kernels[(kernel, len(model.shape))]
+    FD_kernel = kernels[('centered', len(model.shape))]
     eqn1 = FD_kernel(model, u0, v0, space_order)
 
     # Linearized source and stencil
-    if kernel == 'staggered':
-        lin_usrc = -dm * u0.dt
-        lin_vsrc = -dm * v0.dt
-        expr = src * dt / m
-    else:
-        lin_usrc = -dm * u0.dt2
-        lin_vsrc = -dm * v0.dt2
-        expr = src * dt**2 / m
+    lin_usrc = -dm * u0.dt2
+    lin_vsrc = -dm * v0.dt2
 
     eqn2 = FD_kernel(model, du, dv, space_order, qu=lin_usrc, qv=lin_vsrc)
 
     # Construct expression to inject source values, injecting at u0(t+dt)/v0(t+dt)
-    src_term = src.inject(field=u0.forward, expr=expr)
-    src_term += src.inject(field=v0.forward, expr=expr)
+    src_term = src.inject(field=u0.forward, expr=src * dt**2 / m)
+    src_term += src.inject(field=v0.forward, expr=src * dt**2 / m)
 
     # Create interpolation expression for receivers, extracting at du(t)+dv(t)
     rec_term = rec.interpolate(expr=du + dv)
@@ -672,7 +673,7 @@ def JacobianOperator(model, geometry, space_order=4,
 
 
 def JacobianAdjOperator(model, geometry, space_order=4,
-                        save=True, kernel='centered', **kwargs):
+                        save=True, **kwargs):
     """
     Construct a linearized JacobianAdjoint modeling Operator in a TTI media.
 
@@ -690,23 +691,17 @@ def JacobianAdjOperator(model, geometry, space_order=4,
     """
     dt = model.grid.stepping_dim.spacing
     m = model.m
-    time_order = 1 if kernel == 'staggered' else 2
-    if kernel == 'staggered':
-        stagg_p = stagg_r = NODE
-    else:
-        stagg_p = stagg_r = None
+    time_order = 2
 
     # Gradient symbol and wavefield symbols
     u0 = TimeFunction(name='u0', grid=model.grid, save=geometry.nt if save
-                      else None, staggered=stagg_p, time_order=time_order,
-                      space_order=space_order)
+                      else None, time_order=time_order, space_order=space_order)
     v0 = TimeFunction(name='v0', grid=model.grid, save=geometry.nt if save
-                      else None, staggered=stagg_r, time_order=time_order,
-                      space_order=space_order)
+                      else None, time_order=time_order, space_order=space_order)
 
-    du = TimeFunction(name="du", grid=model.grid, staggered=stagg_p, save=None,
+    du = TimeFunction(name="du", grid=model.grid, save=None,
                       time_order=time_order, space_order=space_order)
-    dv = TimeFunction(name="dv", grid=model.grid, staggered=stagg_r, save=None,
+    dv = TimeFunction(name="dv", grid=model.grid, save=None,
                       time_order=time_order, space_order=space_order)
 
     dm = Function(name="dm", grid=model.grid)
@@ -715,18 +710,14 @@ def JacobianAdjOperator(model, geometry, space_order=4,
                    npoint=geometry.nrec)
 
     # FD kernels of the PDE
-    FD_kernel = kernels[(kernel, len(model.shape))]
+    FD_kernel = kernels[('centered', len(model.shape))]
     eqn = FD_kernel(model, du, dv, space_order, forward=False)
 
-    if time_order == 1:
-        dm_update = Inc(dm, - (u0.dt * du + v0.dt * dv))
-    else:
-        dm_update = Inc(dm, - (u0.dt2 * du + v0.dt2 * dv))
+    dm_update = Inc(dm, - (u0 * du.dt2 + v0 * dv.dt2))
 
     # Add expression for receiver injection
-    expr = rec * dt / m if kernel == 'staggered' else rec * dt**2 / m
-    rec_term = rec.inject(field=du.backward, expr=expr)
-    rec_term += rec.inject(field=dv.backward, expr=expr)
+    rec_term = rec.inject(field=du.backward, expr=rec * dt**2 / m)
+    rec_term += rec.inject(field=dv.backward, expr=rec * dt**2 / m)
 
     # Substitute spacing terms to reduce flops
     return Operator(eqn + rec_term + [dm_update], subs=model.spacing_map,

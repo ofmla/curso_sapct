@@ -219,7 +219,7 @@ class Decomposition(tuple):
                 if glb_idx < 0:
                     glb_idx = self.glb_max + glb_idx + 1
                 # -> Do the actual conversion
-                if glb_idx in self.loc_abs_numb:
+                if self.loc_abs_min <= glb_idx <= self.loc_abs_max:
                     return glb_idx - base
                 elif self.glb_min <= glb_idx <= self.glb_max:
                     return None
@@ -239,7 +239,12 @@ class Decomposition(tuple):
                 elif isinstance(glb_idx, slice):
                     if self.loc_empty:
                         return slice(-1, -3)
-                    if glb_idx.step >= 0:
+                    if glb_idx.step >= 0 and glb_idx.stop == self.glb_min:
+                        glb_idx_min = self.glb_min if glb_idx.start is None \
+                            else glb_idx.start
+                        glb_idx_max = self.glb_min
+                        retfunc = lambda a, b: slice(a, b, glb_idx.step)
+                    elif glb_idx.step >= 0:
                         glb_idx_min = self.glb_min if glb_idx.start is None \
                             else glb_idx.start
                         glb_idx_max = self.glb_max if glb_idx.stop is None \

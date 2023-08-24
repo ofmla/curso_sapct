@@ -1,15 +1,17 @@
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterable, MutableSet, Mapping
+from collections.abc import Callable, Iterable, MutableSet, Mapping, Set
 from functools import reduce
 
 import numpy as np
 from multidict import MultiDict
 
+from devito.tools import Pickable
 from devito.tools.utils import as_tuple, filter_ordered
 from devito.tools.algorithms import toposort
 
 __all__ = ['Bunch', 'EnrichedTuple', 'ReducerMap', 'DefaultOrderedDict',
-           'OrderedSet', 'PartialOrderTuple', 'DAG', 'frozendict']
+           'OrderedSet', 'PartialOrderTuple', 'DAG', 'frozendict',
+           'UnboundedMultiTuple']
 
 
 class Bunch(object):
@@ -28,7 +30,7 @@ class Bunch(object):
         self.__dict__.update(kwargs)
 
 
-class EnrichedTuple(tuple):
+class EnrichedTuple(tuple, Pickable):
 
     """
     A tuple with an arbitrary number of additional attributes.
@@ -37,17 +39,35 @@ class EnrichedTuple(tuple):
     def __new__(cls, *items, getters=None, **kwargs):
         obj = super(EnrichedTuple, cls).__new__(cls, items)
         obj.__dict__.update(kwargs)
-        obj._getters = dict(zip(getters or [], items))
+        obj._getters = OrderedDict(zip(getters or [], items))
         return obj
 
     def __getitem__(self, key):
-        if isinstance(key, (int, slice)):
-            return super(EnrichedTuple, self).__getitem__(key)
+        if isinstance(key, int):
+            return super().__getitem__(key)
+        elif isinstance(key, slice):
+            items = super().__getitem__(key)
+            if key.step is not None:
+                return items
+            # Reconstruct as an EnrichedTuple
+            start = key.start or 0
+            stop = key.stop if key.stop is not None else len(self)
+            kwargs = dict(self.__dict__)
+            kwargs['getters'] = list(self._getters)[start:stop]
+            return EnrichedTuple(*items, **kwargs)
         else:
             return self.__getitem_hook__(key)
 
     def __getitem_hook__(self, key):
         return self._getters[key]
+
+    def __getnewargs_ex__(self):
+        # Bypass default reconstruction logic since this class spawns
+        # objects with varying number of attributes
+        return (tuple(self), dict(self.__dict__))
+
+    def get(self, key, val):
+        return self._getters.get(key, val)
 
 
 class ReducerMap(MultiDict):
@@ -95,6 +115,13 @@ class ReducerMap(MultiDict):
             first = candidates[0]
             if isinstance(first, np.ndarray) or isinstance(v, np.ndarray):
                 return (first == v).all()
+            elif isinstance(v, Set):
+                if isinstance(first, Set):
+                    return not v.isdisjoint(first)
+                else:
+                    return first in v
+            elif isinstance(first, Set):
+                return v in first
             else:
                 return first == v
 
@@ -132,6 +159,14 @@ class ReducerMap(MultiDict):
     def reduce_all(self):
         """Returns a dictionary with reduced/unique values for all keys."""
         return {k: self.reduce(key=k) for k in self}
+
+    def reduce_inplace(self):
+        """
+        Like `reduce_all`, but it modifies self inplace, rather than
+        returning the result as a new dict.
+        """
+        for k, v in self.reduce_all().items():
+            self[k] = v
 
 
 class DefaultOrderedDict(OrderedDict):
@@ -176,10 +211,16 @@ class OrderedSet(OrderedDict, MutableSet):
 
     Notes
     -----
-    Originally extracted from:
+    Readapted from:
 
         https://stackoverflow.com/questions/1653970/does-python-have-an-ordered-set
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+        for e in args:
+            self.add(e)
 
     def update(self, *args, **kwargs):
         if kwargs:
@@ -269,7 +310,7 @@ class PartialOrderTuple(tuple):
 class DAG(object):
 
     """
-    A trivial implementation of a directed acyclic graph (DAG).
+    An implementation of a directed acyclic graph (DAG).
 
     Notes
     -----
@@ -429,6 +470,29 @@ class DAG(object):
         else:
             raise ValueError('graph is not acyclic')
 
+    def connected_components(self, enumerated=False):
+        """
+        Find all connected sub-graphs and return them as a list.
+        """
+        groups = []
+
+        for n0 in self.graph:
+            found = {n0} | set(self.all_downstreams(n0))
+            for g in groups:
+                if g.intersection(found):
+                    g.update(found)
+                    break
+            else:
+                groups.append(found)
+
+        if enumerated:
+            mapper = OrderedDict()
+            for n, g in enumerate(groups):
+                mapper.update({i: n for i in g})
+            return mapper
+        else:
+            return tuple(groups)
+
 
 class frozendict(Mapping):
     """
@@ -472,3 +536,66 @@ class frozendict(Mapping):
                 h ^= hash((key, value))
             self._hash = h
         return self._hash
+
+
+class UnboundedMultiTuple(object):
+
+    """
+    An UnboundedMultiTuple is an ordered collection of tuples that can be
+    infinitely iterated over.
+
+    Examples
+    --------
+    >>> ub = UnboundedMultiTuple([1, 2], [3, 4])
+    >>> ub
+    UnboundedMultiTuple((1, 2), (3, 4))
+    >>> ub.iter()
+    >>> ub
+    UnboundedMultiTuple(*(1, 2), (3, 4))
+    >>> ub.next()
+    1
+    >>> ub.next()
+    2
+    >>> ub.iter()
+    >>> ub.iter()  # No effect, tip has reached the last tuple
+    >>> ub.iter()  # No effect, tip has reached the last tuple
+    >>> ub
+    UnboundedMultiTuple((1, 2), *(3, 4))
+    >>> ub.next()
+    3
+    >>> ub.next()
+    4
+    >>> ub.iter()  # Reloads the last iterator
+    >>> ub.next()
+    3
+    """
+
+    def __init__(self, *items):
+        # Normalize input
+        nitems = []
+        for i in as_tuple(items):
+            if isinstance(i, Iterable):
+                nitems.append(tuple(i))
+            else:
+                raise ValueError("Expected sequence, got %s" % type(i))
+
+        self.items = tuple(nitems)
+        self.tip = -1
+        self.curiter = None
+
+    def __repr__(self):
+        items = [str(i) for i in self.items]
+        if self.curiter is not None:
+            items[self.tip] = "*%s" % items[self.tip]
+        return "%s(%s)" % (self.__class__.__name__, ", ".join(items))
+
+    def iter(self):
+        if not self.items:
+            raise ValueError("No tuples available")
+        self.tip = min(self.tip + 1, max(len(self.items) - 1, 0))
+        self.curiter = iter(self.items[self.tip])
+
+    def next(self):
+        if self.curiter is None:
+            raise StopIteration
+        return next(self.curiter)

@@ -1,14 +1,16 @@
-from itertools import chain
+from itertools import chain, product
 
 from cached_property import cached_property
 from sympy import S
 
 from devito.ir.support.space import Backward, IterationSpace
+from devito.ir.support.utils import AccessMode
 from devito.ir.support.vector import LabeledVector, Vector
-from devito.symbolics import retrieve_terminals, q_constant, q_affine
+from devito.symbolics import (retrieve_terminals, q_constant, q_affine, q_routine,
+                              q_terminal)
 from devito.tools import (Tag, as_tuple, is_integer, filter_sorted, flatten,
                           memoized_meth, memoized_generator)
-from devito.types import Dimension, DimensionTuple
+from devito.types import Barrier, Dimension, DimensionTuple, Jump, Symbol
 
 __all__ = ['IterationInstance', 'TimedAccess', 'Scope']
 
@@ -19,6 +21,11 @@ class IndexMode(Tag):
 AFFINE = IndexMode('affine')  # noqa
 REGULAR = IndexMode('regular')
 IRREGULAR = IndexMode('irregular')
+
+mocksym = Symbol(name='⋈')
+"""
+A Symbol to create mock data depdendencies.
+"""
 
 
 class IterationInstance(LabeledVector):
@@ -62,15 +69,23 @@ class IterationInstance(LabeledVector):
         * obj5 is irregular, as two findices appear in the same index function.
     """
 
-    def __new__(cls, indexed):
-        findices = tuple(indexed.function.dimensions)
+    def __new__(cls, access):
+        try:
+            findices = tuple(access.function.dimensions)
+        except AttributeError:
+            # E.g., Objects, which don't have `dimensions`
+            findices = ()
         if len(findices) != len(set(findices)):
             raise ValueError("Illegal non-unique `findices`")
-        return super(IterationInstance, cls).__new__(cls,
-                                                     list(zip(findices, indexed.indices)))
+        try:
+            indices = access.indices
+        except AttributeError:
+            # E.g., `access` is a FieldFromComposite rather than an Indexed
+            indices = (S.Infinity,)*len(findices)
+        return super().__new__(cls, list(zip(findices, indices)))
 
     def __hash__(self):
-        return super(IterationInstance, self).__hash__()
+        return super().__hash__()
 
     @cached_property
     def index_mode(self):
@@ -79,8 +94,20 @@ class IterationInstance(LabeledVector):
             dims = {j for j in i.free_symbols if isinstance(j, Dimension)}
             if len(dims) == 0 and q_constant(i):
                 retval.append(AFFINE)
-            elif len(dims) == 1:
-                candidate = dims.pop()
+                continue
+
+            # TODO: Exploit AffineIndexAccessFunction instead of calling
+            # q_affine -- ultimately it should get quicker!
+
+            sdims = {d for d in dims if d.is_Stencil}
+            if dims == sdims:
+                candidates = sdims
+            else:
+                # E.g. `x + i0 + i1` -> `candidates = {x}`
+                candidates = dims - sdims
+
+            if len(candidates) == 1:
+                candidate = candidates.pop()
                 if fi._defines & candidate._defines:
                     if q_affine(i, candidate):
                         retval.append(AFFINE)
@@ -97,12 +124,13 @@ class IterationInstance(LabeledVector):
         retval = []
         for i, fi in zip(self, self.findices):
             dims = {j for j in i.free_symbols if isinstance(j, Dimension)}
-            if len(dims) == 1:
-                retval.append(dims.pop())
+            sdims = {d for d in dims if d.is_Stencil}
+            candidates = dims - sdims
+
+            if len(candidates) == 1:
+                retval.append(candidates.pop())
             elif isinstance(i, Dimension):
                 retval.append(i)
-            elif q_constant(i):
-                retval.append(fi)
             else:
                 retval.append(None)
         return DimensionTuple(*retval, getters=self.findices)
@@ -110,6 +138,10 @@ class IterationInstance(LabeledVector):
     @property
     def findices(self):
         return self.labels
+
+    @cached_property
+    def index_map(self):
+        return dict(zip(self.aindices, self.findices))
 
     @cached_property
     def defined_findices_affine(self):
@@ -162,14 +194,16 @@ class IterationInstance(LabeledVector):
         return self.rank == 0
 
 
-class TimedAccess(IterationInstance):
+class TimedAccess(IterationInstance, AccessMode):
 
     """
-    An IterationInstance enriched with additional information:
+    A TimedAccess ties together an IterationInstance and an AccessMode.
 
-        * an IterationSpace, from which the TimedAccess is extracted;
-        * A "timestamp", that is an integer indicating the statement within
-          which the TimedAccess appears in the execution flow;
+    Further:
+
+        * It may be associated with an IterationSpace.
+        * It carries a "timestamp", that is an integer indicating the statement
+          within which the TimedAccess appears in the execution flow.
 
     Notes
     -----
@@ -178,22 +212,17 @@ class TimedAccess(IterationInstance):
     on the values of the index functions and the access mode (read, write).
     """
 
-    _modes = ('R', 'W', 'RI', 'WI')
+    def __new__(cls, access, mode, timestamp, ispace=None):
+        obj = super().__new__(cls, access)
+        AccessMode.__init__(obj, mode=mode)
+        return obj
 
-    def __new__(cls, indexed, mode, timestamp, ispace=None):
-        assert mode in cls._modes
+    def __init__(self, access, mode, timestamp, ispace=None):
         assert is_integer(timestamp)
 
-        obj = super(TimedAccess, cls).__new__(cls, indexed)
-
-        obj.indexed = indexed
-        obj.function = indexed.function
-        obj.mode = mode
-        obj.timestamp = timestamp
-
-        obj.ispace = ispace or IterationSpace([])
-
-        return obj
+        self.access = access
+        self.timestamp = timestamp
+        self.ispace = ispace or IterationSpace([])
 
     def __repr__(self):
         mode = '\033[1;37;31mW\033[0m' if self.is_write else '\033[1;37;32mR\033[0m'
@@ -207,12 +236,16 @@ class TimedAccess(IterationInstance):
         # which might require expensive comparisons of Vector entries (i.e.,
         # SymPy expressions)
 
-        return (self.indexed is other.indexed and  # => self.function is other.function
+        return (self.access is other.access and  # => self.function is other.function
                 self.mode == other.mode and
                 self.ispace == other.ispace)
 
     def __hash__(self):
-        return super(TimedAccess, self).__hash__()
+        return super().__hash__()
+
+    @property
+    def function(self):
+        return self.access.function
 
     @property
     def name(self):
@@ -231,42 +264,26 @@ class TimedAccess(IterationInstance):
         return self.ispace.itintervals
 
     @property
-    def is_read(self):
-        return self.mode in ['R', 'RI']
-
-    @property
-    def is_write(self):
-        return self.mode in ['W', 'WI']
-
-    @property
-    def is_read_increment(self):
-        return self.mode == 'RI'
-
-    @property
-    def is_write_increment(self):
-        return self.mode == 'WI'
-
-    @property
-    def is_increment(self):
-        return self.is_read_increment or self.is_write_increment
-
-    @property
     def is_local(self):
         return self.function.is_Symbol
 
     @cached_property
     def is_regular(self):
-        if not super(TimedAccess, self).is_regular:
+        if not super().is_regular:
             return False
 
         # The order of the `aindices` must match the order of the iteration
         # space Dimensions
         positions = []
         for d in self.aindices:
-            for n, i in enumerate(self.intervals):
-                if i.dim._defines & d._defines:
-                    positions.append(n)
-                    break
+            try:
+                for n, i in enumerate(self.intervals):
+                    if i.dim._defines & d._defines:
+                        positions.append(n)
+                        break
+            except AttributeError:
+                # `d is None` due to e.g. constant access
+                continue
         return positions == sorted(positions)
 
     def __lt__(self, other):
@@ -276,7 +293,7 @@ class TimedAccess(IterationInstance):
             raise TypeError("Cannot compare due to mismatching `direction`")
         if self.intervals != other.intervals:
             raise TypeError("Cannot compare due to mismatching `intervals`")
-        return super(TimedAccess, self).__lt__(other)
+        return super().__lt__(other)
 
     def lex_eq(self, other):
         return self.timestamp == other.timestamp
@@ -327,19 +344,89 @@ class TimedAccess(IterationInstance):
                 # E.g., `self=R<f,[cy]>` and `self.itintervals=(y,)` => `sai=None`
                 pass
 
-            ai = sai
-            fi = self.findices[n]
+            if self.function._mem_shared:
+                # Special case: the distance between two regular, thread-shared
+                # objects fallbacks to zero, as any other value would be nonsensical.
+                ret.append(S.Zero)
 
-            if not ai or ai._defines & sit.dim._defines:
-                # E.g., `self=R<f,[t + 1, x]>`, `self.itintervals=(time, x)` and `ai=t`
+            elif sai and oai and sai._defines & sit.dim._defines:
+                # E.g., `self=R<f,[t + 1, x]>`, `self.itintervals=(time, x)`
+                # and `ai=t`
                 if sit.direction is Backward:
                     ret.append(other[n] - self[n])
                 else:
                     ret.append(self[n] - other[n])
-            elif fi in sit.dim._defines:
+
+            elif not sai and not oai:
+                # E.g., `self=R<a,[3]>` and `other=W<a,[4]>`
+                if self[n] - other[n] == 0:
+                    ret.append(S.Zero)
+                else:
+                    break
+
+            elif sai in self.ispace and oai in other.ispace:
+                # E.g., `self=R<f,[x, y]>`, `sai=time`, self.itintervals=(time, x, y)
+                # with `n=0`
+                continue
+
+            elif any(d and d._defines & sit.dim._defines for d in (sai, oai)):
+                # In some cases, the distance degenerates because `self` and
+                # `other` never intersect, which essentially means there's no
+                # dependence between them. In this case, we set the distance to
+                # a dummy value (the imaginary unit). Hence, we call these
+                # "imaginary dependences". This occurs in just a small set of
+                # special cases, which we handle here
+
+                # Case 1: `sit` is an IterationInterval with statically known
+                # trip count. E.g. it ranges from 0 to 3; `other` performs a
+                # constant access at 4
+                for v in (self[n], other[n]):
+                    try:
+                        if bool(v < sit.symbolic_min or v > sit.symbolic_max):
+                            return Vector(S.ImaginaryUnit)
+                    except TypeError:
+                        pass
+
+                # Case 2: `sit` is an IterationInterval over a local SubDimension
+                # and `other` performs a constant access
+                for d0, d1 in ((sai, oai), (oai, sai)):
+                    if d0 is None and d1.is_Sub and d1.local:
+                        return Vector(S.ImaginaryUnit)
+
+                # Fallback
+                ret.append(S.Infinity)
+                break
+
+            elif self.findices[n] in sit.dim._defines:
                 # E.g., `self=R<u,[t+1, ii_src_0+1, ii_src_1+2]>` and `fi=p_src` (`n=1`)
                 ret.append(S.Infinity)
                 break
+
+        if S.Infinity in ret:
+            return Vector(*ret)
+
+        n = len(ret)
+
+        # It might be `a[t, ⊥] -> a[t, x+1]`, that is the source is a special
+        # Indexed representing an arbitrary access along `x`, within the `t`
+        # IterationSpace, while the sink lives within the `tx` IterationSpace
+        if len(self.itintervals[n:]) != len(other.itintervals[n:]):
+            v = Vector(*ret)
+            if v != 0:
+                return v
+            else:
+                ret.append(S.Infinity)
+                return Vector(*ret)
+
+        # It still could be an imaginary dependence, e.g. `a[3] -> a[4]` or, more
+        # nasty, `a[i+1, 3] -> a[i, 4]`
+        for i, j in zip(self[n:], other[n:]):
+            if i == j:
+                ret.append(S.Zero)
+            else:
+                v = i - j
+                if v.is_Number and v.is_finite:
+                    return Vector(S.ImaginaryUnit)
 
         return Vector(*ret)
 
@@ -399,20 +486,20 @@ class TimedAccess(IterationInstance):
         return (touch_halo_left, touch_halo_right)
 
 
-class Dependence(object):
+class Relation(object):
 
     """
-    A data dependence between two TimedAccess objects.
+    A relation between two TimedAccess objects.
     """
 
     def __init__(self, source, sink):
         assert isinstance(source, TimedAccess) and isinstance(sink, TimedAccess)
-        assert source.function is sink.function
+        assert source.function == sink.function
         self.source = source
         self.sink = sink
 
     def __repr__(self):
-        return "%s -> %s" % (self.source, self.sink)
+        return "%s -- %s" % (self.source, self.sink)
 
     def __eq__(self, other):
         # If the timestamps are equal in `self` (ie, an inplace dependence) then
@@ -450,6 +537,72 @@ class Dependence(object):
             for d in i._defines:
                 retval[d] = j
         return retval
+
+    @cached_property
+    def is_regular(self):
+        # NOTE: what we do below is stronger than something along the lines of
+        # `self.source.is_regular and self.sink.is_regular`
+        # `source` and `sink` may be regular in isolation, but the relation
+        # itself could be irregular, as the two TimedAccesses may stem from
+        # different iteration spaces. Instead if the distance is an integer
+        # vector, it is guaranteed that the iteration space is the same
+        return all(is_integer(i) for i in self.distance)
+
+    @cached_property
+    def is_irregular(self):
+        return not self.is_regular
+
+    @cached_property
+    def is_lex_positive(self):
+        """
+        True if the source preceeds the sink, False otherwise.
+        """
+        return self.source.timestamp < self.sink.timestamp
+
+    @cached_property
+    def is_lex_equal(self):
+        """
+        True if the source has same timestamp as the sink, False otherwise.
+        """
+        return self.source.timestamp == self.sink.timestamp
+
+    @cached_property
+    def is_lex_ne(self):
+        """True if the source's and sink's timestamps differ, False otherwise."""
+        return self.source.timestamp != self.sink.timestamp
+
+    @cached_property
+    def is_lex_negative(self):
+        """
+        True if the sink preceeds the source, False otherwise.
+        """
+        return self.source.timestamp > self.sink.timestamp
+
+    @cached_property
+    def is_lex_non_stmt(self):
+        """
+        True if either the source or the sink are from non-statements,
+        False otherwise.
+        """
+        return self.source.timestamp == -1 or self.sink.timestamp == -1
+
+    @property
+    def is_local(self):
+        return self.function.is_Symbol
+
+    @property
+    def is_imaginary(self):
+        return S.ImaginaryUnit in self.distance
+
+
+class Dependence(Relation):
+
+    """
+    A data dependence between two TimedAccess objects.
+    """
+
+    def __repr__(self):
+        return "%s -> %s" % (self.source, self.sink)
 
     @cached_property
     def cause(self):
@@ -495,59 +648,21 @@ class Dependence(object):
 
     @cached_property
     def is_iaw(self):
-        """Is it an increment-after-write dependence ?"""
-        return self.source.is_write and self.sink.is_increment
+        """Is it an reduction-after-write dependence ?"""
+        return self.source.is_write and self.sink.is_reduction
 
     @cached_property
-    def is_increment(self):
-        return self.source.is_increment or self.sink.is_increment
+    def is_reduction(self):
+        return self.source.is_reduction or self.sink.is_reduction
 
-    @cached_property
-    def is_regular(self):
-        # Note: what we do below is stronger than something along the lines of
-        # `self.source.is_regular and self.sink.is_regular`
-        # `source` and `sink` may be regular in isolation, but the dependence
-        # itself could be irregular, as the two TimedAccesses may stem from
-        # different iteration spaces. Instead if the distance is an integer
-        # vector, it is guaranteed that the iteration space is the same
-        return all(is_integer(i) for i in self.distance)
-
-    @cached_property
-    def is_irregular(self):
-        return not self.is_regular
-
-    @cached_property
-    def is_lex_positive(self):
-        """True if the source preceeds the sink, False otherwise."""
-        return self.source.timestamp < self.sink.timestamp
-
-    @cached_property
-    def is_lex_equal(self):
-        """True if the source has same timestamp as the sink, False otherwise."""
-        return self.source.timestamp == self.sink.timestamp
-
-    @cached_property
-    def is_lex_negative(self):
-        """True if the sink preceeds the source, False otherwise."""
-        return self.source.timestamp > self.sink.timestamp
-
-    @cached_property
-    def is_lex_non_stmt(self):
+    @memoized_meth
+    def is_const(self, dim):
         """
-        True if either the source or the sink are from non-statements, False otherwise.
+        True if a constant dependence, that is no Dimensions involved, False otherwise.
         """
-        return self.source.timestamp == -1 or self.sink.timestamp == -1
-
-    @cached_property
-    def is_cross(self):
-        """
-        True if both source and sink are from the same IterationSpace, False otherwise.
-        """
-        return self.source.ispace is not self.sink.ispace
-
-    @property
-    def is_local(self):
-        return self.function.is_Symbol
+        return (self.source.aindices[dim] is None and
+                self.sink.aindices[dim] is None and
+                self.distance_mapper[dim] == 0)
 
     @memoized_meth
     def is_carried(self, dim=None):
@@ -567,7 +682,7 @@ class Dependence(object):
         Return True if ``dim`` may represent a reduction dimension for
         ``self``, False otherwise.
         """
-        return (self.is_increment and
+        return (self.is_reduction and
                 self.is_regular and
                 not (dim._defines & self._defined_findices))
 
@@ -624,9 +739,10 @@ class Dependence(object):
         cause the access of the same memory location, False otherwise.
         """
         for d in self.findices:
-            if (d._defines & set(as_tuple(dims)) and
-                    any(i.is_NonlinearDerived for i in d._defines)):
-                return True
+            if d._defines & set(as_tuple(dims)):
+                if any(i.is_NonlinearDerived for i in d._defines) or \
+                   self.is_const(d):
+                    return True
         return False
 
 
@@ -646,9 +762,9 @@ class DependenceGroup(set):
         return len(self) == 0
 
     @cached_property
-    def increment(self):
-        """Return the increment-induced dependences."""
-        return DependenceGroup(i for i in self if i.is_increment)
+    def reduction(self):
+        """Return the reduction-induced dependences."""
+        return DependenceGroup(i for i in self if i.is_reduction)
 
     def carried(self, dim=None):
         """Return the dimension-carried dependences."""
@@ -694,23 +810,38 @@ class Scope(object):
 
         for i, e in enumerate(exprs):
             # Reads
-            for j in retrieve_terminals(e.rhs):
+            terminals = retrieve_terminals(e.rhs, deep=True, mode='unique')
+            try:
+                terminals.update(retrieve_terminals(e.lhs.indices))
+            except AttributeError:
+                pass
+            for j in terminals:
                 v = self.reads.setdefault(j.function, [])
-                mode = 'RI' if e.is_Increment and j.function is e.lhs.function else 'R'
+                mode = 'RR' if e.is_Reduction and j.function is e.lhs.function else 'R'
                 v.append(TimedAccess(j, mode, i, e.ispace))
 
             # Write
-            v = self.writes.setdefault(e.lhs.function, [])
-            mode = 'WI' if e.is_Increment else 'W'
-            v.append(TimedAccess(e.lhs, mode, i, e.ispace))
+            terminals = []
+            if q_terminal(e.lhs):
+                terminals.append(e.lhs)
+            if q_routine(e.rhs):
+                try:
+                    terminals.extend(e.rhs.writes)
+                except AttributeError:
+                    # E.g., foreign routines, such as `cos` or `sin`
+                    pass
+            for j in terminals:
+                v = self.writes.setdefault(j.function, [])
+                mode = 'WR' if e.is_Reduction else 'W'
+                v.append(TimedAccess(j, mode, i, e.ispace))
 
-            # If an increment, we got one implicit read
-            if e.is_Increment:
+            # If a reduction, we got one implicit read
+            if e.is_Reduction:
                 v = self.reads.setdefault(e.lhs.function, [])
-                v.append(TimedAccess(e.lhs, 'RI', i, e.ispace))
+                v.append(TimedAccess(e.lhs, 'RR', i, e.ispace))
 
             # If writing to a scalar, we have an initialization
-            if not e.is_Increment and e.is_scalar:
+            if not e.is_Reduction and e.is_scalar:
                 self.initialized.add(e.lhs.function)
 
             # Look up ConditionalDimensions
@@ -722,10 +853,21 @@ class Scope(object):
         # The iteration symbols too
         dimensions = set().union(*[e.dimensions for e in exprs])
         for d in dimensions:
-            for i in d._defines_symbols:
-                for j in i.free_symbols:
-                    v = self.reads.setdefault(j.function, [])
-                    v.append(TimedAccess(j, 'R', -1))
+            for i in d.free_symbols | d.bound_symbols:
+                v = self.reads.setdefault(i.function, [])
+                v.append(TimedAccess(i, 'R', -1))
+
+        # Objects altering the control flow (e.g., synchronization barriers,
+        # break statements, ...) are converted into mock dependences
+        for i, e in enumerate(exprs):
+            if e.find(Barrier) | e.find(Jump):
+                self.writes.setdefault(mocksym, []).append(
+                    TimedAccess(mocksym, 'W', i, e.ispace)
+                )
+                self.reads.setdefault(mocksym, []).extend([
+                    TimedAccess(mocksym, 'R', max(i, 0), e.ispace),
+                    TimedAccess(mocksym, 'R', i+1, e.ispace),
+                ])
 
         # A set of rules to drive the collection of dependencies
         self.rules = as_tuple(rules)
@@ -772,6 +914,10 @@ class Scope(object):
         return [i for group in groups for i in group]
 
     @cached_property
+    def indexeds(self):
+        return tuple(i.access for i in self.accesses if i.access.is_Indexed)
+
+    @cached_property
     def functions(self):
         return set(self.reads) | set(self.writes)
 
@@ -799,8 +945,9 @@ class Scope(object):
                     except TypeError:
                         # Non-integer vectors are not comparable.
                         # Conservatively, we assume it is a dependence, unless
-                        # it's a read-for-increment
-                        is_flow = not r.is_read_increment
+                        # it's a read-for-reduction
+                        is_flow = (not dependence.is_imaginary and
+                                   not r.is_read_reduction)
                     if is_flow:
                         yield dependence
 
@@ -826,8 +973,9 @@ class Scope(object):
                     except TypeError:
                         # Non-integer vectors are not comparable.
                         # Conservatively, we assume it is a dependence, unless
-                        # it's a read-for-increment
-                        is_anti = not r.is_read_increment
+                        # it's a read-for-reduction
+                        is_anti = (not dependence.is_imaginary and
+                                   not r.is_read_reduction)
                     if is_anti:
                         yield dependence
 
@@ -853,7 +1001,7 @@ class Scope(object):
                     except TypeError:
                         # Non-integer vectors are not comparable.
                         # Conservatively, we assume it is a dependence
-                        is_output = True
+                        is_output = not dependence.is_imaginary
                     if is_output:
                         yield dependence
 
@@ -891,3 +1039,28 @@ class Scope(object):
         TimedAccess objects.
         """
         return DependenceGroup(self.d_from_access_gen(accesses))
+
+    @memoized_generator
+    def r_gen(self):
+        """
+        Generate the Relations of the Scope.
+        """
+        for f in self.functions:
+            v = self.reads.get(f, []) + self.writes.get(f, [])
+
+            for a0, a1 in product(v, v):
+                if a0 is a1:
+                    continue
+
+                r = Relation(a0, a1)
+                if r.is_imaginary:
+                    continue
+
+                yield r
+
+    @cached_property
+    def r_all(self):
+        """
+        All Relations of the Scope.
+        """
+        return list(self.r_gen())

@@ -1,25 +1,34 @@
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from functools import singledispatch
 
-from devito.ir import DummyEq, Cluster, Scope
-from devito.passes.clusters.utils import cluster_pass, makeit_ssa
-from devito.symbolics import count, estimate_cost, q_xop, q_leaf, uxreplace
-from devito.types import Symbol
+from sympy import Add, Function, Indexed, Mul, Pow
+
+from devito.finite_differences.differentiable import IndexDerivative
+from devito.ir import Cluster, Scope, cluster_pass
+from devito.passes.clusters.utils import makeit_ssa
+from devito.symbolics import estimate_cost, q_leaf
+from devito.symbolics.manipulation import _uxreplace
+from devito.types import Eq, Temp as Temp0
 
 __all__ = ['cse']
 
 
+class Temp(Temp0):
+    pass
+
+
 @cluster_pass
-def cse(cluster, sregistry, *args):
+def cse(cluster, sregistry, options, *args):
     """
     Common sub-expressions elimination (CSE).
     """
-    make = lambda: Symbol(name=sregistry.make_name(), dtype=cluster.dtype).indexify()
-    processed = _cse(cluster.exprs, make)
+    make = lambda: Temp(name=sregistry.make_name(), dtype=cluster.dtype)
+    exprs = _cse(cluster, make, min_cost=options['cse-min-cost'])
 
-    return cluster.rebuild(processed)
+    return cluster.rebuild(exprs=exprs)
 
 
-def _cse(maybe_exprs, make, mode='default'):
+def _cse(maybe_exprs, make, min_cost=1, mode='default'):
     """
     Main common sub-expressions elimination routine.
 
@@ -45,9 +54,8 @@ def _cse(maybe_exprs, make, mode='default'):
 
     # Just for flexibility, accept either Clusters or exprs
     if isinstance(maybe_exprs, Cluster):
-        cluster = maybe_exprs
-        processed = list(cluster.exprs)
-        scope = cluster.scope
+        processed = list(maybe_exprs.exprs)
+        scope = maybe_exprs.scope
     else:
         processed = list(maybe_exprs)
         scope = Scope(maybe_exprs)
@@ -61,68 +69,113 @@ def _cse(maybe_exprs, make, mode='default'):
     #
     # `a[i] + 1` will be excluded, as there's a flow Dimension-independent data
     # dependence involving `a`
-    exclude = {i.source.indexed for i in scope.d_flow.independent()}
+    d_flow = {i.source.access for i in scope.d_flow.independent()}
+    d_anti = {i.source.access for i in scope.d_anti.independent()}
+    exclude = d_flow & d_anti
 
-    mapped = []
     while True:
         # Detect redundancies
-        counted = count(mapped + processed, q_xop).items()
+        counted = count(processed).items()
         targets = OrderedDict([(k, estimate_cost(k, True)) for k, v in counted if v > 1])
 
         # Rule out Dimension-independent data dependencies
         targets = OrderedDict([(k, v) for k, v in targets.items()
                                if not k.free_symbols & exclude])
 
-        if not targets:
+        if not targets or max(targets.values()) < min_cost:
             break
 
         # Create temporaries
         hit = max(targets.values())
-        picked = [k for k, v in targets.items() if v == hit]
-        mapper = OrderedDict([(e, make()) for i, e in enumerate(picked)])
+        temps = [Eq(make(), k) for k, v in targets.items() if v == hit]
 
         # Apply replacements
-        processed = [uxreplace(e, mapper) for e in processed]
-        mapped = [uxreplace(e, mapper) for e in mapped]
-        mapped = [DummyEq(v, k) for k, v in reversed(list(mapper.items()))] + mapped
+        # The extracted temporaries are inserted before the first expression
+        # that contains it
+        updated = []
+        for e in processed:
+            pe = e
+            for t in temps:
+                pe, changed = _uxreplace(pe, {t.rhs: t.lhs})
+                if changed and t not in updated:
+                    updated.append(t)
+            updated.append(pe)
+        processed = updated
 
         # Update `exclude` for the same reasons as above -- to rule out CSE across
         # Dimension-independent data dependences
-        exclude.update({i for i in mapper.values()})
-
-        # Prepare for the next round
-        for k in picked:
-            targets.pop(k)
-    processed = mapped + processed
+        exclude.update({t.lhs for t in temps})
 
     # At this point we may have useless temporaries (e.g., r0=r1). Let's drop them
-    processed = _compact_temporaries(processed)
+    processed = _compact_temporaries(processed, exclude)
 
     return processed
 
 
-def _compact_temporaries(exprs):
+def _compact_temporaries(exprs, exclude):
     """
     Drop temporaries consisting of isolated symbols.
     """
     # First of all, convert to SSA
     exprs = makeit_ssa(exprs)
 
-    # What's gonna be dropped
+    # Drop candidates are all exprs in the form `t0 = s` where `s` is a symbol
+    # Note: only CSE-captured Temps, which are by construction local objects, may
+    # safely be compacted; a generic Symbol could instead be accessed in a subsequent
+    # Cluster, for example: `for (i = ...) { a = b; for (j = a ...) ...`
     mapper = {e.lhs: e.rhs for e in exprs
-              if e.lhs.is_Symbol and (q_leaf(e.rhs) or e.rhs.is_Function)}
+              if isinstance(e.lhs, Temp) and q_leaf(e.rhs) and e.lhs not in exclude}
 
     processed = []
     for e in exprs:
         if e.lhs not in mapper:
             # The temporary is retained, and substitutions may be applied
-            expr = e
-            while True:
-                handle = uxreplace(expr, mapper)
-                if handle == expr:
-                    break
-                else:
-                    expr = handle
-            processed.append(handle)
+            expr, changed = e, True
+            while changed:
+                expr, changed = _uxreplace(expr, mapper)
+            processed.append(expr)
 
     return processed
+
+
+@singledispatch
+def count(expr):
+    """
+    Construct a mapper `expr -> #occurrences` for each sub-expression in `expr`.
+    """
+    mapper = Counter()
+    for a in expr.args:
+        mapper.update(count(a))
+    return mapper
+
+
+@count.register(list)
+@count.register(tuple)
+def _(exprs):
+    mapper = Counter()
+    for e in exprs:
+        mapper.update(count(e))
+    return mapper
+
+
+@count.register(IndexDerivative)
+@count.register(Indexed)
+def _(expr):
+    """
+    Handler for objects preventing CSE to propagate through their arguments.
+    """
+    return Counter()
+
+
+@count.register(Add)
+@count.register(Mul)
+@count.register(Pow)
+@count.register(Function)
+def _(expr):
+    mapper = Counter()
+    for a in expr.args:
+        mapper.update(count(a))
+
+    mapper[expr] += 1
+
+    return mapper

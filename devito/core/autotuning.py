@@ -8,6 +8,7 @@ from devito.logger import perf, warning as _warning
 from devito.mpi.distributed import MPI, MPINeighborhood
 from devito.mpi.routines import MPIMsgEnriched
 from devito.parameters import configuration
+from devito.symbolics import normalize_args
 from devito.tools import filter_ordered, flatten, is_integer, prod
 from devito.types import Timer
 
@@ -44,43 +45,44 @@ def autotune(operator, args, level, mode):
 
     # User-provided output data won't be altered in `preemptive` mode
     if mode == 'preemptive':
-        output = {i.name: i for i in operator.output}
-        copies = {k: output[k]._C_as_ndarray(v).copy()
-                  for k, v in args.items() if k in output}
+        writes = {i.name: i for i in operator.writes}
+        copies = {k: writes[k]._C_as_ndarray(v).copy()
+                  for k, v in args.items() if k in writes}
         # WARNING: `copies` keeps references to numpy arrays, which is required
         # to avoid garbage collection to kick in during autotuning and prematurely
         # free the shadow copies handed over to C-land
-        at_args.update({k: output[k]._C_make_dataobj(v) for k, v in copies.items()})
+        at_args.update({k: writes[k]._C_make_dataobj(v) for k, v in copies.items()})
 
     # Disable halo exchanges through MPI_PROC_NULL
     if mode in ['preemptive', 'destructive']:
         for p in operator.parameters:
             if isinstance(p, MPINeighborhood):
-                at_args.update(MPINeighborhood(p.neighborhood)._arg_values())
+                at_args.update(
+                    MPINeighborhood(p.neighborhood)._arg_values()
+                )
                 for i in p.fields:
                     setattr(at_args[p.name]._obj, i, MPI.PROC_NULL)
             elif isinstance(p, MPIMsgEnriched):
-                at_args.update(MPIMsgEnriched(p.name, p.function, p.halos)._arg_values())
+                at_args.update(
+                    MPIMsgEnriched(p.name, p.target, p.halos)._arg_values(args)
+                )
                 for i in at_args[p.name]:
                     i.fromrank = MPI.PROC_NULL
                     i.torank = MPI.PROC_NULL
 
     roots = [operator.body] + [i.root for i in operator._func_table.values()]
-    trees = filter_ordered(retrieve_iteration_tree(roots), key=lambda i: i.root)
+    trees = filter_ordered(retrieve_iteration_tree(roots))
 
     # Detect the time-stepping Iteration; shrink its iteration range so that
     # each autotuning run only takes a few iterations
     steppers = {i for i in flatten(trees) if i.dim.is_Time}
-    if len(steppers) == 0:
-        stepper = None
-        timesteps = 1
-    elif len(steppers) == 1:
+    if len(steppers) == 1:
         stepper = steppers.pop()
         timesteps = init_time_bounds(stepper, at_args, args)
         if timesteps is None:
             return args, {}
     else:
-        warning("cannot perform autotuning unless there is one time loop; skipping")
+        warning("cannot perform autotuning with %d time loops; skipping" % len(steppers))
         return args, {}
 
     # Use a fresh Timer for auto-tuning
@@ -89,9 +91,14 @@ def autotune(operator, args, level, mode):
 
     # Perform autotuning
     timings = {}
+    seen = set()
     for n, tree in enumerate(trees):
         blockable = [i.dim for i in tree if not is_integer(i.step)]
+        # Continue if `blockable` appear more than once under a tree
+        if all(i in seen for i in blockable):
+            continue
 
+        seen.update(blockable)
         # Tunable arguments
         try:
             tunable = []
@@ -115,7 +122,8 @@ def autotune(operator, args, level, mode):
             at_args.update(dict(run))
 
             # Drop run if not at least one block per thread
-            if not configuration['develop-mode'] and nblocks_per_thread.subs(at_args) < 1:
+            if not configuration['develop-mode'] and \
+                    nblocks_per_thread.subs(normalize_args(at_args)) < 1:
                 continue
 
             # Run the Operator
@@ -211,7 +219,7 @@ def init_time_bounds(stepper, at_args, args):
 
 
 def check_time_bounds(stepper, at_args, args, mode):
-    if mode != 'runtime' or stepper is None:
+    if mode != 'runtime':
         return True
     dim = stepper.dim.root
     if stepper.direction is Backward:
@@ -250,7 +258,14 @@ def finalize_time_bounds(stepper, at_args, args, mode):
 
 
 def calculate_nblocks(tree, blockable):
-    collapsed = tree[:(tree[0].ncollapsed or 1)]
+    block_indices = [n for n, i in enumerate(tree) if i.dim in blockable]
+    index = block_indices[0]
+    try:
+        ncollapsed = tree[index].ncollapsed
+    except AttributeError:
+        # Not using OpenMP
+        ncollapsed = 0
+    collapsed = tree[index:index + (ncollapsed or index+1)]
     blocked = [i.dim for i in collapsed if i.dim in blockable]
     remainders = [(d.root.symbolic_max-d.root.symbolic_min+1) % d.step for d in blocked]
     niters = [d.root.symbolic_max - i for d, i in zip(blocked, remainders)]
@@ -260,6 +275,8 @@ def calculate_nblocks(tree, blockable):
 
 
 def generate_block_shapes(blockable, args, level):
+    args = normalize_args(args)
+
     if not blockable:
         raise ValueError
 
@@ -308,13 +325,13 @@ def generate_block_shapes(blockable, args, level):
         for bs in list(ret):
             handle = []
             for v in options['blocksize-l1']:
-                # To be a valid blocksize, it must be smaller than and divide evenly
-                # the parent's block size
+                # To be a valid block size, it must be smaller than
+                # and divide evenly the parent's block size
                 if all(v <= i and i % v == 0 for _, i in bs):
                     ret.append(bs + tuple((d.step, v) for d in level_1))
             ret.remove(bs)
 
-    # Generate level-n (n > 1) block shapes
+    # Generate level-n (n > 2) block shapes
     # TODO -- currently, there's no Operator producing depth>2 hierarchical blocking,
     # so for simplicity we ignore this for the time being
 

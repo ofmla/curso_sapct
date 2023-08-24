@@ -1,9 +1,9 @@
 from collections import defaultdict
 
-from sympy import Add, Mul, collect
+from sympy import Add, Mul, S, collect
 
-from devito.passes.clusters.utils import cluster_pass
-from devito.symbolics import estimate_cost, retrieve_symbols
+from devito.ir import cluster_pass
+from devito.symbolics import BasicWrapperMixin, estimate_cost, retrieve_symbols
 from devito.tools import ReducerMap
 
 __all__ = ['factorize']
@@ -78,8 +78,11 @@ def collect_const(expr):
             # Back to the running example
             # -> (a + c)
             add = Add(*v)
-            # -> 3.*(a + c)
-            mul = Mul(k, add, evaluate=False)
+            if add == 0:
+                mul = S.Zero
+            else:
+                # -> 3.*(a + c)
+                mul = Mul(k, add, evaluate=False)
 
         terms.append(mul)
 
@@ -112,7 +115,7 @@ def collect_nested(expr):
             return expr, {'funcs': expr}
         elif expr.is_Pow:
             return expr, {'pows': expr}
-        elif expr.is_Symbol or expr.is_Indexed or expr.is_Atom:
+        elif expr.is_Symbol or expr.is_Indexed or isinstance(expr, BasicWrapperMixin):
             return expr, {}
         elif expr.is_Add:
             args, candidates = zip(*[run(arg) for arg in expr.args])

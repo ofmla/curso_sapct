@@ -1,19 +1,21 @@
 from collections import namedtuple
 
 import sympy
+from sympy.core.decorators import call_highest_priority
 import numpy as np
 from cached_property import cached_property
 
 from devito.data import LEFT, RIGHT
 from devito.exceptions import InvalidArgument
 from devito.logger import debug
-from devito.tools import Pickable, dtype_to_cstr, is_integer
+from devito.tools import Pickable, is_integer
 from devito.types.args import ArgProvider
 from devito.types.basic import Symbol, DataSymbol, Scalar
 
 __all__ = ['Dimension', 'SpaceDimension', 'TimeDimension', 'DefaultDimension',
            'CustomDimension', 'SteppingDimension', 'SubDimension', 'ConditionalDimension',
-           'dimensions', 'ModuloDimension', 'IncrDimension']
+           'ModuloDimension', 'IncrDimension', 'BlockDimension', 'StencilDimension',
+           'Spacing', 'dimensions']
 
 
 Thickness = namedtuple('Thickness', 'left right')
@@ -36,13 +38,11 @@ class Dimension(ArgProvider):
                                            |
                               ---------------------------
                               |                         |
-                       BasicDimension            DefaultDimension
+                       DerivedDimension            DefaultDimension
                               |
-                      DerivedDimension
-                              |
-            ---------------------------------------
-            |                 |                   |
-      SteppingDimension   SubDimension   ConditionalDimension
+                   ---------------------
+                   |                   |
+              SubDimension   ConditionalDimension
 
     Parameters
     ----------
@@ -101,11 +101,17 @@ class Dimension(ArgProvider):
     is_Sub = False
     is_Conditional = False
     is_Stepping = False
+    is_Stencil = False
+    is_SubIterator = False
     is_Modulo = False
     is_Incr = False
+    is_Block = False
 
-    _C_typename = 'const %s' % dtype_to_cstr(np.int32)
-    _C_typedata = _C_typename
+    # Prioritize self's __add__ and __sub__ to construct AffineIndexAccessFunction
+    _op_priority = sympy.Expr._op_priority + 1.
+
+    __rargs__ = ('name',)
+    __rkwargs__ = ('spacing',)
 
     def __new__(cls, *args, **kwargs):
         """
@@ -183,24 +189,36 @@ class Dimension(ArgProvider):
     def root(self):
         return self
 
+    @cached_property
+    def bound_symbols(self):
+        candidates = [self.symbolic_min, self.symbolic_max, self.symbolic_size,
+                      self.symbolic_incr]
+        return frozenset(i for i in candidates if not i.is_Number)
+
     @property
     def _maybe_distributed(self):
         """Could it be a distributed Dimension?"""
         return True
 
-    @property
-    def _C_name(self):
-        return self.name
-
     @cached_property
     def _defines(self):
         return frozenset({self})
 
-    @cached_property
-    def _defines_symbols(self):
-        candidates = [self.symbolic_min, self.symbolic_max, self.symbolic_size,
-                      self.symbolic_incr]
-        return frozenset(i for i in candidates if not i.is_Number)
+    @call_highest_priority('__radd__')
+    def __add__(self, other):
+        return AffineIndexAccessFunction(self, other)
+
+    @call_highest_priority('__add__')
+    def __radd__(self, other):
+        return AffineIndexAccessFunction(self, other)
+
+    @call_highest_priority('__rsub__')
+    def __sub__(self, other):
+        return AffineIndexAccessFunction(self, -other)
+
+    @call_highest_priority('__sub__')
+    def __rsub__(self, other):
+        return AffineIndexAccessFunction(other, -self)
 
     @property
     def _arg_names(self):
@@ -226,7 +244,7 @@ class Dimension(ArgProvider):
                 dim.size_name: size,
                 dim.max_name: size if size is None else size-1}
 
-    def _arg_values(self, args, interval, grid, **kwargs):
+    def _arg_values(self, interval, grid=None, args=None, **kwargs):
         """
         Produce a map of argument values after evaluating user input. If no user
         input is provided, get a known value in ``args`` and adjust it so that no
@@ -236,11 +254,9 @@ class Dimension(ArgProvider):
 
         Parameters
         ----------
-        args : dict
-            Known argument values.
         interval : Interval
             Description of the Dimension data space.
-        grid : Grid
+        grid : Grid, optional
             Used for spacing overriding and MPI execution; if ``self`` is a distributed
             Dimension, then ``grid`` is used to translate user input into rank-local
             indices.
@@ -270,6 +286,18 @@ class Dimension(ArgProvider):
             except (AttributeError, TypeError):
                 pass
 
+        # Some `args` may still be DerivedDimenions' defaults. These, in turn,
+        # may represent sets of legal values. If that's the case, here we just
+        # pick one. Note that we sort for determinism
+        try:
+            loc_minv = sorted(loc_minv).pop(0)
+        except TypeError:
+            pass
+        try:
+            loc_maxv = sorted(loc_maxv).pop(0)
+        except TypeError:
+            pass
+
         return {self.min_name: loc_minv, self.max_name: loc_maxv}
 
     def _arg_check(self, args, size, interval):
@@ -293,7 +321,8 @@ class Dimension(ArgProvider):
                 upper = interval.upper
             else:
                 # Autopadding causes non-integer upper limit
-                upper = interval.upper.subs(args)
+                from devito.symbolics import normalize_args
+                upper = interval.upper.subs(normalize_args(args))
             if args[self.max_name] + upper >= size:
                 raise InvalidArgument("OOB detected due to %s=%d" % (self.max_name,
                                                                      args[self.max_name]))
@@ -309,9 +338,12 @@ class Dimension(ArgProvider):
                   self.max_name, args[self.max_name], self.name)
 
     # Pickling support
-    _pickle_args = ['name']
-    _pickle_kwargs = ['spacing']
     __reduce_ex__ = Pickable.__reduce_ex__
+    __getnewargs_ex__ = Pickable.__getnewargs_ex__
+
+
+class Spacing(Scalar):
+    pass
 
 
 class BasicDimension(Dimension, Symbol):
@@ -321,8 +353,8 @@ class BasicDimension(Dimension, Symbol):
     def __new__(cls, *args, **kwargs):
         return Symbol.__new__(cls, *args, **kwargs)
 
-    def __init_finalize__(self, name, spacing=None):
-        self._spacing = spacing or Scalar(name='h_%s' % name, is_const=True)
+    def __init_finalize__(self, name, spacing=None, **kwargs):
+        self._spacing = spacing or Spacing(name='h_%s' % name, is_const=True)
 
 
 class DefaultDimension(Dimension, DataSymbol):
@@ -350,8 +382,8 @@ class DefaultDimension(Dimension, DataSymbol):
     def __new__(cls, *args, **kwargs):
         return DataSymbol.__new__(cls, *args, **kwargs)
 
-    def __init_finalize__(self, name, spacing=None, default_value=None):
-        self._spacing = spacing or Scalar(name='h_%s' % name, is_const=True)
+    def __init_finalize__(self, name, spacing=None, default_value=None, **kwargs):
+        self._spacing = spacing or Spacing(name='h_%s' % name, is_const=True)
         self._default_value = default_value or 0
 
     @cached_property
@@ -423,6 +455,9 @@ class DerivedDimension(BasicDimension):
 
     is_Derived = True
 
+    __rargs__ = Dimension.__rargs__ + ('parent',)
+    __rkwargs__ = ()
+
     def __init_finalize__(self, name, parent):
         assert isinstance(parent, Dimension)
         self._parent = parent
@@ -454,9 +489,10 @@ class DerivedDimension(BasicDimension):
         """A DerivedDimension performs no runtime checks."""
         return
 
-    # Pickling support
-    _pickle_args = Dimension._pickle_args + ['parent']
-    _pickle_kwargs = []
+
+# ***
+# The Dimensions below are exposed in the user API. They can only be created by
+# the user
 
 
 class SubDimension(DerivedDimension):
@@ -509,7 +545,11 @@ class SubDimension(DerivedDimension):
 
     is_Sub = True
 
-    def __init_finalize__(self, name, parent, left, right, thickness, local):
+    __rargs__ = (DerivedDimension.__rargs__ +
+                 ('symbolic_min', 'symbolic_max', 'thickness', 'local'))
+    __rkwargs__ = ()
+
+    def __init_finalize__(self, name, parent, left, right, thickness, local, **kwargs):
         super().__init_finalize__(name, parent)
         self._interval = sympy.Interval(left, right)
         self._thickness = Thickness(*thickness)
@@ -570,6 +610,11 @@ class SubDimension(DerivedDimension):
     def thickness(self):
         return self._thickness
 
+    @cached_property
+    def bound_symbols(self):
+        # Add thickness symbols
+        return frozenset().union(*[i.free_symbols for i in super().bound_symbols])
+
     @property
     def _maybe_distributed(self):
         return not self.local
@@ -577,10 +622,6 @@ class SubDimension(DerivedDimension):
     @cached_property
     def _thickness_map(self):
         return dict(self.thickness)
-
-    @cached_property
-    def _defines_symbols(self):
-        return super()._defines_symbols | frozenset(self._thickness_map)
 
     @cached_property
     def _offset_left(self):
@@ -637,7 +678,7 @@ class SubDimension(DerivedDimension):
     def _arg_defaults(self, grid=None, **kwargs):
         return {}
 
-    def _arg_values(self, args, interval, grid, **kwargs):
+    def _arg_values(self, interval, grid=None, **kwargs):
         # Allow override of thickness values to disable BCs
         # However, arguments from the user are considered global
         # So overriding the thickness to a nonzero value should not cause
@@ -667,11 +708,6 @@ class SubDimension(DerivedDimension):
 
         return {i.name: v for i, v in zip(self._thickness_map, (ltkn, rtkn))}
 
-    # Pickling support
-    _pickle_args = DerivedDimension._pickle_args +\
-        ['symbolic_min', 'symbolic_max', 'thickness', 'local']
-    _pickle_kwargs = []
-
 
 class ConditionalDimension(DerivedDimension):
 
@@ -684,7 +720,7 @@ class ConditionalDimension(DerivedDimension):
     ----------
     name : str
         Name of the dimension.
-    parent : Dimension
+    parent : Dimension, optional
         The parent Dimension.
     factor : int, optional
         The number of iterations between two executions of the if-branch. If None
@@ -694,7 +730,7 @@ class ConditionalDimension(DerivedDimension):
         Dimension. When it evaluates to True, the if-branch is executed. If None
         (default), ``factor`` must be provided.
     indirect : bool, optional
-        If True, use ``condition``, rather than the parent Dimension, to
+        If True, use `self`, rather than the parent Dimension, to
         index into arrays. A typical use case is when arrays are accessed
         indirectly via the ``condition`` expression. Defaults to False.
 
@@ -724,9 +760,9 @@ class ConditionalDimension(DerivedDimension):
         }
 
     Another typical use case is when one needs to constrain the execution of
-    loop iterations to make sure certain conditions are honoured. The following
-    artificial example employs indirect array accesses and uses ConditionalDimension
-    to guard against out-of-bounds accesses.
+    loop iterations so that certain conditions are honoured. The following
+    artificial example uses ConditionalDimension to guard against out-of-bounds
+    accesses in indirectly accessed arrays.
 
     >>> from sympy import And
     >>> ci = ConditionalDimension(name='ci', parent=i,
@@ -749,9 +785,17 @@ class ConditionalDimension(DerivedDimension):
     is_NonlinearDerived = True
     is_Conditional = True
 
-    def __init_finalize__(self, name, parent, factor=None, condition=None,
-                          indirect=False):
+    __rkwargs__ = DerivedDimension.__rkwargs__ + ('factor', 'condition', 'indirect')
+
+    def __init_finalize__(self, name, parent=None, factor=None, condition=None,
+                          indirect=False, **kwargs):
+        # `parent=None` degenerates to a ConditionalDimension outside of
+        # any iteration space
+        if parent is None:
+            parent = BOTTOM
+
         super().__init_finalize__(name, parent)
+
         self._factor = factor
         self._condition = condition
         self._indirect = indirect
@@ -781,82 +825,35 @@ class ConditionalDimension(DerivedDimension):
         retval = set(super(ConditionalDimension, self).free_symbols)
         if self.condition is not None:
             retval |= self.condition.free_symbols
+        try:
+            retval |= self.factor.free_symbols
+        except AttributeError:
+            pass
         return retval
 
-    # Pickling support
-    _pickle_kwargs = DerivedDimension._pickle_kwargs + ['factor', 'condition', 'indirect']
+    def _arg_defaults(self, _min=None, size=None, alias=None):
+        defaults = super()._arg_defaults(_min=_min, size=size, alias=alias)
+
+        # We can also add the parent's default endpoint. Note that exactly
+        # `factor` endpoints are legal, so we return them all. It's then
+        # up to the caller to decide which one to pick upon reduction
+        dim = alias or self
+        if dim._factor is None or size is None:
+            return defaults
+        try:
+            # Is it a symbolic factor?
+            factor = defaults[dim._factor.name] = dim._factor.data
+        except AttributeError:
+            factor = dim._factor
+        defaults[dim.parent.max_name] = \
+            frozenset(range(factor*(size - 1), factor*(size)))
+
+        return defaults
 
 
-class SteppingDimension(DerivedDimension):
-
-    """
-    Symbol defining a convex iteration sub-space derived from a ``parent``
-    Dimension, which cyclically produces a finite range of values, such
-    as ``0, 1, 2, 0, 1, 2, 0, ...`` (also referred to as "modulo buffered
-    iteration").
-
-    SteppingDimension is most commonly used to represent a time-stepping Dimension.
-
-    Parameters
-    ----------
-    name : str
-        Name of the dimension.
-    parent : Dimension
-        The parent Dimension.
-    """
-
-    is_NonlinearDerived = True
-    is_Stepping = True
-
-    @property
-    def symbolic_min(self):
-        return self.parent.symbolic_min
-
-    @property
-    def symbolic_max(self):
-        return self.parent.symbolic_max
-
-    @property
-    def _arg_names(self):
-        return (self.min_name, self.max_name, self.name) + self.parent._arg_names
-
-    def _arg_defaults(self, _min=None, **kwargs):
-        """
-        A map of default argument values defined by this dimension.
-
-        Parameters
-        ----------
-        _min : int, optional
-            Minimum point as provided by data-carrying objects.
-
-        Notes
-        -----
-        A SteppingDimension does not know its max point and therefore
-        does not have a size argument.
-        """
-        return {self.parent.min_name: _min}
-
-    def _arg_values(self, *args, **kwargs):
-        """
-        The argument values provided by a SteppingDimension are those
-        of its parent, as it acts as an alias.
-        """
-        values = {}
-
-        if self.min_name in kwargs:
-            values[self.parent.min_name] = kwargs.pop(self.min_name)
-
-        if self.max_name in kwargs:
-            values[self.parent.max_name] = kwargs.pop(self.max_name)
-
-        # Let the dimension name be an alias for `dim_e`
-        if self.name in kwargs:
-            values[self.parent.max_name] = kwargs.pop(self.name)
-
-        return values
-
-
-# The Dimensions below are for internal use only
+# ***
+# The Dimensions below are for internal use only. They are created by the compiler
+# during the construction of an Operator
 
 
 class ModuloDimension(DerivedDimension):
@@ -899,9 +896,12 @@ class ModuloDimension(DerivedDimension):
 
     is_NonlinearDerived = True
     is_Modulo = True
+    is_SubIterator = True
 
-    def __init_finalize__(self, name, parent,
-                          offset=None, modulo=None, incr=None, origin=None):
+    __rkwargs__ = ('offset', 'modulo', 'incr', 'origin')
+
+    def __init_finalize__(self, name, parent, offset=None, modulo=None, incr=None,
+                          origin=None, **kwargs):
         super().__init_finalize__(name, parent)
 
         # Sanity check
@@ -965,17 +965,14 @@ class ModuloDimension(DerivedDimension):
         except (TypeError, ValueError):
             return incr
 
+    @cached_property
+    def bound_symbols(self):
+        return set(self.parent.bound_symbols)
+
     def _arg_defaults(self, **kwargs):
-        """
-        A ModuloDimension provides no arguments, so this method returns an empty dict.
-        """
         return {}
 
     def _arg_values(self, *args, **kwargs):
-        """
-        A ModuloDimension provides no arguments, so there are no argument values
-        to be derived.
-        """
         return {}
 
     # Override SymPy arithmetic operators to exploit properties of modular arithmetic
@@ -1000,11 +997,8 @@ class ModuloDimension(DerivedDimension):
             pass
         return super().__sub__(other)
 
-    # Pickling support
-    _pickle_kwargs = ['offset', 'modulo', 'incr', 'origin']
 
-
-class IncrDimension(DerivedDimension):
+class AbstractIncrDimension(DerivedDimension):
 
     """
     Dimension symbol representing a non-contiguous sub-region of a given
@@ -1034,9 +1028,11 @@ class IncrDimension(DerivedDimension):
     """
 
     is_Incr = True
-    is_PerfKnob = True
 
-    def __init_finalize__(self, name, parent, _min, _max, step=None, size=None):
+    __rargs__ = ('name', 'parent', 'symbolic_min', 'symbolic_max')
+    __rkwargs__ = ('step', 'size')
+
+    def __init_finalize__(self, name, parent, _min, _max, step=None, size=None, **kwargs):
         super().__init_finalize__(name, parent)
         self._min = _min
         self._max = _max
@@ -1046,6 +1042,13 @@ class IncrDimension(DerivedDimension):
     @property
     def size(self):
         return self._size
+
+    @property
+    def _depth(self):
+        """
+        The depth of `self` in the hierarchy of IncrDimensions.
+        """
+        return len([i for i in self._defines if i.is_Incr])
 
     @cached_property
     def step(self):
@@ -1093,6 +1096,36 @@ class IncrDimension(DerivedDimension):
             return self.step
 
     @cached_property
+    def bound_symbols(self):
+        ret = set(self.parent.bound_symbols)
+        if self.symbolic_incr.is_Symbol:
+            ret.add(self.symbolic_incr)
+        return frozenset(ret)
+
+
+class IncrDimension(AbstractIncrDimension):
+
+    """
+    A concrete implementation of an AbstractIncrDimension.
+
+    Notes
+    -----
+    This type should not be instantiated directly in user code.
+    """
+
+    is_SubIterator = True
+
+
+class BlockDimension(AbstractIncrDimension):
+
+    """
+    Dimension symbol for lowering TILABLE Dimensions.
+    """
+
+    is_Block = True
+    is_PerfKnob = True
+
+    @cached_property
     def _arg_names(self):
         try:
             return (self.step.name,)
@@ -1109,16 +1142,17 @@ class IncrDimension(DerivedDimension):
             # `step` not a Symbol
             return {}
 
-    def _arg_values(self, args, interval, grid, **kwargs):
+    def _arg_values(self, interval, grid=None, args=None, **kwargs):
         try:
             name = self.step.name
         except AttributeError:
             # `step` not a Symbol
             return {}
+
         if name in kwargs:
             return {name: kwargs.pop(name)}
-        elif isinstance(self.parent, IncrDimension):
-            # `self` is an IncrDimension within an outer IncrDimension, but
+        elif isinstance(self.parent, BlockDimension):
+            # `self` is a BlockDimension within an outer BlockDimension, but
             # no value supplied -> the sub-block will span the entire block
             return {name: args[self.parent.step.name]}
         else:
@@ -1137,8 +1171,8 @@ class IncrDimension(DerivedDimension):
             return
 
         value = args[name]
-        if isinstance(self.parent, IncrDimension):
-            # sub-IncrDimensions must be perfect divisors of their parent
+        if isinstance(self.parent, BlockDimension):
+            # sub-BlockDimensions must be perfect divisors of their parent
             parent_value = args[self.parent.step.name]
             if parent_value % value > 0:
                 raise InvalidArgument("Illegal block size `%s=%d`: sub-block sizes "
@@ -1155,25 +1189,27 @@ class IncrDimension(DerivedDimension):
                                       "iteration range and it will cause an OOB access"
                                       % (name, value))
 
-    # Pickling support
-    _pickle_args = ['name', 'parent', 'symbolic_min', 'symbolic_max']
-    _pickle_kwargs = ['step', 'size']
-
 
 class CustomDimension(BasicDimension):
 
     """
-    Dimension defining an iteration space with custom (known) size.
+    Dimension defining an iteration space with known size. Unlike a
+    DefaultDimension, a CustomDimension:
+
+        * Provides more freedom -- the symbolic_{min,max,size} can be set at will;
+        * It provides no runtime argument values.
 
     Notes
     -----
-    This could be extended in the future for more customization (e.g., incr.).
+    This type should not be instantiated directly in user code.
     """
 
     is_Custom = True
 
+    __rkwargs__ = ('symbolic_min', 'symbolic_max', 'symbolic_size', 'parent')
+
     def __init_finalize__(self, name, symbolic_min=None, symbolic_max=None,
-                          symbolic_size=None, parent=None):
+                          symbolic_size=None, parent=None, **kwargs):
         self._symbolic_min = symbolic_min
         self._symbolic_max = symbolic_max
         self._symbolic_size = symbolic_size
@@ -1201,6 +1237,13 @@ class CustomDimension(BasicDimension):
             return self.parent.spacing
         else:
             return self._spacing
+
+    @property
+    def bound_symbols(self):
+        ret = {self.symbolic_min, self.symbolic_max, self.symbolic_size}
+        if self.is_Derived:
+            ret.update(self.parent.bound_symbols)
+        return frozenset(i for i in ret if i.is_Symbol)
 
     @cached_property
     def _defines(self):
@@ -1252,10 +1295,295 @@ class CustomDimension(BasicDimension):
         """A CustomDimension performs no runtime checks."""
         return
 
-    # Pickling support
-    _pickle_kwargs = ['symbolic_min', 'symbolic_max', 'symbolic_size', 'parent']
+
+class DynamicDimensionMixin(object):
+
+    """
+    A mixin to create Dimensions producing non-const Symbols.
+    """
+
+    @cached_property
+    def symbolic_size(self):
+        return Scalar(name=self.size_name, dtype=np.int32)
+
+    @cached_property
+    def symbolic_min(self):
+        return Scalar(name=self.min_name, dtype=np.int32)
+
+    @cached_property
+    def symbolic_max(self):
+        return Scalar(name=self.max_name, dtype=np.int32)
+
+
+class DynamicDimension(DynamicDimensionMixin, BasicDimension):
+    pass
+
+
+class DynamicSubDimension(DynamicDimensionMixin, SubDimension):
+
+    @classmethod
+    def _symbolic_thickness(cls, name):
+        return (Scalar(name="%s_ltkn" % name, dtype=np.int32, nonnegative=True),
+                Scalar(name="%s_rtkn" % name, dtype=np.int32, nonnegative=True))
+
+
+class StencilDimension(BasicDimension):
+
+    """
+    Dimension symbol representing the points of a stencil.
+
+    Parameters
+    ----------
+    name : str
+        Name of the dimension.
+    _min : expr-like
+        The minimum point of the stencil.
+    _max : expr-like
+        The maximum point of the stencil.
+    spacing : expr-like, optional
+        The space between two stencil points.
+    """
+
+    is_Stencil = True
+
+    __rargs__ = BasicDimension.__rargs__ + ('_min', '_max')
+
+    def __init_finalize__(self, name, _min, _max, spacing=None, **kwargs):
+        self._spacing = sympy.sympify(spacing) or sympy.S.One
+
+        if not is_integer(_min):
+            raise ValueError("Expected integer `min` (got %s)" % _min)
+        if not is_integer(_max):
+            raise ValueError("Expected integer `max` (got %s)" % _max)
+        if not is_integer(self._spacing):
+            raise ValueError("Expected integer `spacing` (got %s)" % self._spacing)
+
+        self._min = _min
+        self._max = _max
+        self._size = _max - _min + 1
+
+        if self._size < 1:
+            raise ValueError("Expected size greater than 0 (got %s)" % self._size)
+
+    def _hashable_content(self):
+        return super()._hashable_content() + (self._min, self._max, self._spacing)
+
+    @cached_property
+    def symbolic_size(self):
+        return sympy.Number(self._size)
+
+    @cached_property
+    def symbolic_min(self):
+        return sympy.Number(self._min)
+
+    @cached_property
+    def symbolic_max(self):
+        return sympy.Number(self._max)
+
+    @property
+    def range(self):
+        return range(self._min, self._max + 1)
+
+    @property
+    def _arg_names(self):
+        return ()
+
+    def _arg_defaults(self, **kwargs):
+        return {}
+
+    def _arg_values(self, *args, **kwargs):
+        return {}
+
+
+# ***
+# The Dimensions below are created by Devito and may eventually be
+# accessed in user code to e.g. construct or manipulate Eqs
+
+
+class SteppingDimension(DerivedDimension):
+
+    """
+    Symbol defining a convex iteration sub-space derived from a ``parent``
+    Dimension, which cyclically produces a finite range of values, such
+    as ``0, 1, 2, 0, 1, 2, 0, ...`` (also referred to as "modulo buffered
+    iteration").
+
+    SteppingDimension is most commonly used to represent a time-stepping Dimension.
+
+    Parameters
+    ----------
+    name : str
+        Name of the dimension.
+    parent : Dimension
+        The parent Dimension.
+    """
+
+    is_NonlinearDerived = True
+    is_Stepping = True
+    is_SubIterator = True
+
+    @property
+    def symbolic_min(self):
+        return self.parent.symbolic_min
+
+    @property
+    def symbolic_max(self):
+        return self.parent.symbolic_max
+
+    @property
+    def _arg_names(self):
+        return (self.min_name, self.max_name, self.name) + self.parent._arg_names
+
+    def _arg_defaults(self, _min=None, **kwargs):
+        """
+        A map of default argument values defined by this dimension.
+
+        Parameters
+        ----------
+        _min : int, optional
+            Minimum point as provided by data-carrying objects.
+
+        Notes
+        -----
+        A SteppingDimension does not know its max point and therefore
+        does not have a size argument.
+        """
+        return {self.parent.min_name: _min}
+
+    def _arg_values(self, *args, **kwargs):
+        """
+        The argument values provided by a SteppingDimension are those
+        of its parent, as it acts as an alias.
+        """
+        values = {}
+
+        if self.min_name in kwargs:
+            values[self.parent.min_name] = kwargs.pop(self.min_name)
+
+        if self.max_name in kwargs:
+            values[self.parent.max_name] = kwargs.pop(self.max_name)
+
+        # Let the dimension name be an alias for `dim_e`
+        if self.name in kwargs:
+            values[self.parent.max_name] = kwargs.pop(self.name)
+
+        return values
+
+
+# *** Utils
+
+
+class IndexAccessFunction(sympy.Add):
+
+    """
+    A IndexAccessFunction is an expression used to index into a Function.
+    """
+
+    # Prioritize self's __add__ and __sub__ to construct AffineIndexAccessFunction
+    _op_priority = sympy.Add._op_priority + 1.
+
+    def __eq__(self, other):
+        return super().__eq__(other)
+
+    __hash__ = sympy.Add.__hash__
+
+    @call_highest_priority('__radd__')
+    def __add__(self, other):
+        return self.func(self, other)
+
+    @call_highest_priority('__add__')
+    def __radd__(self, other):
+        return self.func(self, other)
+
+    @call_highest_priority('__rsub__')
+    def __sub__(self, other):
+        return self.func(self, -other)
+
+    @call_highest_priority('__sub__')
+    def __rsub__(self, other):
+        return self.func(other, -self)
+
+    def __mod__(self, other):
+        return sympy.Mod(sympy.Add(*self.args), other)
+
+
+class AffineIndexAccessFunction(IndexAccessFunction):
+    """
+    An AffineIndexAccessFunction is the sum of three operands:
+
+        * the "main" Dimension (in practice a SpaceDimension or a TimeDimension);
+        * an offset (number or symbolic expression, of dtype integer).
+        * a StencilDimension;
+
+    Examples
+    --------
+    The AffineIndexAccessFunction `x + sd + 3`, with `sd in [-2, 2]`, represents
+    the index access functions `[x + 1, x + 2, x + 3, x + 4, x + 5]`
+    """
+
+    def __new__(cls, *args, **kwargs):
+        d = 0
+        sd = 0
+        ofs_items = []
+        for a in args:
+            if isinstance(a, StencilDimension):
+                if sd != 0:
+                    return sympy.Add(*args, **kwargs)
+                sd = a
+            elif isinstance(a, Dimension):
+                d = cls._separate_dims(d, a, ofs_items)
+                if d is None:
+                    return sympy.Add(*args, **kwargs)
+            elif isinstance(a, AffineIndexAccessFunction):
+                if sd != 0 and a.sd != 0:
+                    return sympy.Add(*args, **kwargs)
+                d = cls._separate_dims(d, a.d, ofs_items)
+                if d is None:
+                    return sympy.Add(*args, **kwargs)
+                sd = a.sd
+                ofs_items.append(a.ofs)
+            else:
+                ofs_items.append(a)
+
+        ofs = sympy.Add(*[i for i in ofs_items if i is not None])
+        if not all(is_integer(i) or i.is_Symbol for i in ofs.free_symbols):
+            return sympy.Add(*args, **kwargs)
+
+        obj = IndexAccessFunction.__new__(cls, d, ofs, sd)
+
+        if isinstance(obj, AffineIndexAccessFunction):
+            obj.d = d
+            obj.ofs = ofs
+            obj.sd = sd
+        else:
+            # E.g., SymPy simplified it to Zero or something else
+            pass
+
+        return obj
+
+    @classmethod
+    def _separate_dims(cls, d0, d1, ofs_items):
+        if d0 == 0 and d1 == 0:
+            return None
+        elif d0 == 0 and isinstance(d1, Dimension):
+            return d1
+        elif d1 == 0 and isinstance(d0, Dimension):
+            return d0
+        elif isinstance(d0, Dimension) and isinstance(d1, AbstractIncrDimension):
+            # E.g., `time + x0_blk0` after skewing
+            ofs_items.append(d1)
+            return d0
+        elif isinstance(d1, Dimension) and isinstance(d0, AbstractIncrDimension):
+            # E.g., `time + x0_blk0` after skewing
+            ofs_items.append(d0)
+            return d1
+        else:
+            return None
 
 
 def dimensions(names):
-    assert type(names) == str
+    assert type(names) is str
     return tuple(Dimension(i) for i in names.split())
+
+
+BOTTOM = Dimension(name='⊥')

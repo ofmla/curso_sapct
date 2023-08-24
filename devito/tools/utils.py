@@ -1,4 +1,3 @@
-import ctypes
 from collections import OrderedDict
 from collections.abc import Iterable
 from functools import reduce
@@ -8,13 +7,12 @@ import types
 
 import numpy as np
 import sympy
-from cgen import dtype_to_ctype as cgen_dtype_to_ctype
 
-__all__ = ['prod', 'as_tuple', 'is_integer', 'generator', 'grouper', 'split', 'roundm',
-           'powerset', 'invert', 'flatten', 'single_or', 'filter_ordered', 'as_mapper',
-           'filter_sorted', 'dtype_to_cstr', 'dtype_to_ctype', 'dtype_to_mpitype',
-           'ctypes_to_cstr', 'ctypes_pointer', 'pprint', 'sweep', 'all_equal', 'as_list',
-           'indices_to_slices', 'indices_to_sections']
+__all__ = ['prod', 'as_tuple', 'is_integer', 'generator', 'grouper', 'split',
+           'roundm', 'powerset', 'invert', 'flatten', 'single_or', 'filter_ordered',
+           'as_mapper', 'filter_sorted', 'pprint', 'sweep', 'all_equal', 'as_list',
+           'indices_to_slices', 'indices_to_sections', 'transitive_closure',
+           'humanbytes']
 
 
 def prod(iterable, initial=1):
@@ -30,15 +28,18 @@ def as_list(item, type=None, length=None):
 
 def as_tuple(item, type=None, length=None):
     """
-    Force item to a tuple.
+    Force item to a tuple. Passes tuple subclasses through also.
 
     Partly extracted from: https://github.com/OP2/PyOP2/.
     """
     # Empty list if we get passed None
     if item is None:
         t = ()
-    elif isinstance(item, (str, sympy.Function)):
+    elif isinstance(item, (str, sympy.Function, sympy.IndexedBase)):
         t = (item,)
+    elif isinstance(item, tuple):
+        # this makes tuple subclasses pass through
+        t = item
     else:
         # Convert iterable to list...
         try:
@@ -46,6 +47,7 @@ def as_tuple(item, type=None, length=None):
         # ... or create a list of a single item
         except (TypeError, NotImplementedError):
             t = (item,) * (length or 1)
+
     if length and not len(t) == length:
         raise ValueError("Tuple needs to be of length %d" % length)
     if type and not all(isinstance(i, type) for i in t):
@@ -60,7 +62,7 @@ def as_mapper(iterable, key=None, get=None):
     """
     key = key or (lambda i: i)
     get = get or (lambda i: i)
-    mapper = {}
+    mapper = OrderedDict()
     for i in iterable:
         mapper.setdefault(key(i), []).append(get(i))
     return mapper
@@ -186,66 +188,6 @@ def filter_sorted(elements, key=None):
     return sorted(filter_ordered(elements, key=key), key=key)
 
 
-def dtype_to_cstr(dtype):
-    """Translate numpy.dtype into C string."""
-    return cgen_dtype_to_ctype(dtype)
-
-
-def dtype_to_ctype(dtype):
-    """Translate numpy.dtype into a ctypes type."""
-    return {np.int32: ctypes.c_int,
-            np.float32: ctypes.c_float,
-            np.int64: ctypes.c_int64,
-            np.float64: ctypes.c_double}[dtype]
-
-
-def dtype_to_mpitype(dtype):
-    """Map numpy types to MPI datatypes."""
-    return {np.int32: 'MPI_INT',
-            np.float32: 'MPI_FLOAT',
-            np.int64: 'MPI_LONG',
-            np.float64: 'MPI_DOUBLE'}[dtype]
-
-
-def ctypes_to_cstr(ctype, toarray=None):
-    """Translate ctypes types into C strings."""
-    if issubclass(ctype, ctypes.Structure):
-        return 'struct %s' % ctype.__name__
-    elif issubclass(ctype, ctypes.Union):
-        return 'union %s' % ctype.__name__
-    elif issubclass(ctype, ctypes._Pointer):
-        if toarray:
-            return ctypes_to_cstr(ctype._type_, '(* %s)' % toarray)
-        else:
-            return '%s *' % ctypes_to_cstr(ctype._type_)
-    elif issubclass(ctype, ctypes.Array):
-        return '%s[%d]' % (ctypes_to_cstr(ctype._type_, toarray), ctype._length_)
-    elif ctype.__name__.startswith('c_'):
-        if ctype.__name__.startswith('c_volatile_'):
-            name = 'volatile %s' % ctype.__name__[11:]
-        else:
-            name = ctype.__name__[2:]
-        # A primitive datatype
-        # FIXME: Is there a better way of extracting the C typename ?
-        # Here, we're following the ctypes convention that each basic type has
-        # either the format c_X_p or c_X, where X is the C typename, for instance
-        # `int` or `float`.
-        if name.endswith('_p'):
-            return '%s *' % name[:-2]
-        elif toarray:
-            return '%s %s' % (name, toarray)
-        else:
-            return name
-    else:
-        # A custom datatype (e.g., a typedef-ed pointer to struct)
-        return ctype.__name__
-
-
-def ctypes_pointer(name):
-    """Create a ctypes type representing a C pointer to a custom data type ``name``."""
-    return type("c_%s_p" % name, (ctypes.c_void_p,), {})
-
-
 def pprint(node, verbose=True):
     """
     Shortcut to pretty print Iteration/Expression trees.
@@ -302,3 +244,61 @@ def indices_to_sections(inputlist):
     slices = indices_to_slices(inputlist)
     sections = [(i, j - i) for i, j in slices]
     return sections
+
+
+def reachable_items(R, k, visited):
+    try:
+        ans = R[k]
+        if ans != [] and ans not in visited:
+            visited.append(ans)
+            ans = reachable_items(R, ans, visited)
+        return ans
+    except:
+        return k
+
+
+def transitive_closure(R):
+    '''
+    Partially inherited from: https://www.buzzphp.com/posts/transitive-closure
+    Helps to collapse paths in a graph. In other words, helps to simplfiy a mapper's
+    keys and values when values also appears in keys.
+
+    Example
+    -------
+    mapper = {a:b, b:c, c:d}
+    mapper = transitive_closure(mapper)
+
+    mapper
+    {a:d, b:d, c:d}
+    '''
+    ans = dict()
+    for k in R.keys():
+        visited = []
+        ans[k] = reachable_items(R, k, visited)
+    return ans
+
+
+def humanbytes(B):
+    """
+    Return the given bytes as a human friendly KB, MB, GB, or TB string.
+
+    Extracted and then readapted from:
+        https://stackoverflow.com/questions/12523586/python-format-size-\
+                application-converting-b-to-kb-mb-gb-tb
+    """
+    B = float(B)
+    KB = float(1024)
+    MB = float(KB ** 2)  # 1,048,576
+    GB = float(KB ** 3)  # 1,073,741,824
+    TB = float(KB ** 4)  # 1,099,511,627,776
+
+    if B < KB:
+        return '%d %s' % (int(B), 'B')
+    elif KB <= B < MB:
+        return '%d KB' % round(B / KB)
+    elif MB <= B < GB:
+        return '%d MB' % round(B / MB)
+    elif GB <= B < TB:
+        return '%.1f GB' % round(B / GB, 1)
+    elif TB <= B:
+        return '%.2f TB' % round(B / TB, 1)

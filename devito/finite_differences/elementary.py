@@ -1,6 +1,9 @@
 import sympy
 
+from packaging.version import Version
+
 from devito.finite_differences.differentiable import DifferentiableFunction, diffify
+from devito.types.lazy import Evaluable
 
 
 class factorial(DifferentiableFunction, sympy.factorial):
@@ -87,18 +90,16 @@ def root(x):
     return diffify(sympy.root(x))
 
 
-class Min(sympy.Min):
+class Min(sympy.Min, Evaluable):
 
-    @property
-    def evaluate(self):
-        return self.func(*[getattr(a, 'evaluate', a) for a in self.args])
+    def _evaluate(self, **kwargs):
+        return self.func(*self._evaluate_args(**kwargs), evaluate=False)
 
 
-class Max(sympy.Max):
+class Max(sympy.Max, Evaluable):
 
-    @property
-    def evaluate(self):
-        return self.func(*[getattr(a, 'evaluate', a) for a in self.args])
+    def _evaluate(self, **kwargs):
+        return self.func(*self._evaluate_args(**kwargs), evaluate=False)
 
 
 def Id(x):
@@ -646,7 +647,7 @@ class mathieucprime(DifferentiableFunction, sympy.mathieucprime):
 
 
 # New elementary functions in sympy 1.8
-if float(sympy.__version__) >= 1.8:
+if Version(sympy.__version__) >= Version('1.8'):
 
     class motzkin(DifferentiableFunction, sympy.motzkin):
         __sympy_class__ = sympy.motzkin

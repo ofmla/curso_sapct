@@ -3,12 +3,12 @@ from operator import attrgetter
 
 from sympy import sympify
 
-from devito.symbolics import (retrieve_functions, retrieve_indexed, split_affine,
-                              uxreplace)
-from devito.tools import PartialOrderTuple, filter_sorted, flatten, as_tuple
-from devito.types import Dimension, Eq
+from devito.symbolics import retrieve_indexed, uxreplace
+from devito.tools import PartialOrderTuple, as_tuple, filter_sorted, flatten
+from devito.types import Dimension, IgnoreDimSort
+from devito.types.basic import AbstractFunction
 
-__all__ = ['dimension_sort', 'generate_implicit_exprs', 'lower_exprs']
+__all__ = ['dimension_sort', 'lower_exprs']
 
 
 def dimension_sort(expr):
@@ -21,22 +21,31 @@ def dimension_sort(expr):
         relation = []
         for i in indexed.indices:
             try:
-                maybe_dim = split_affine(i).var
-                if isinstance(maybe_dim, Dimension):
-                    relation.append(maybe_dim)
-            except ValueError:
-                # Maybe there are some nested Indexeds (e.g., the situation is A[B[i]])
+                # Assume it's an AffineIndexAccessFunction...
+                relation.append(i.d)
+            except AttributeError:
+                # It's not! Maybe there are some nested Indexeds (e.g., the
+                # situation is A[B[i]])
                 nested = flatten(handle_indexed(n) for n in retrieve_indexed(i))
                 if nested:
                     relation.extend(nested)
-                else:
-                    # Fallback: Just insert all the Dimensions we find, regardless of
-                    # what the user is attempting to do
-                    relation.extend([d for d in filter_sorted(i.free_symbols)
-                                     if isinstance(d, Dimension)])
-        return tuple(relation)
+                    continue
 
-    relations = {handle_indexed(i) for i in retrieve_indexed(expr)}
+                # Fallback: Just insert all the Dimensions we find, regardless of
+                # what the user is attempting to do
+                relation.extend([d for d in filter_sorted(i.free_symbols)
+                                 if isinstance(d, Dimension)])
+
+        # StencilDimensions are lowered subsequently through special compiler
+        # passes, so they can be ignored here
+        relation = tuple(d for d in relation if not d.is_Stencil)
+
+        return relation
+
+    if isinstance(expr.implicit_dims, IgnoreDimSort):
+        relations = set()
+    else:
+        relations = {handle_indexed(i) for i in retrieve_indexed(expr)}
 
     # Add in any implicit dimension (typical of scalar temporaries, or Step)
     relations.add(expr.implicit_dims)
@@ -70,42 +79,6 @@ def dimension_sort(expr):
     return ordering
 
 
-def generate_implicit_exprs(expressions):
-    """
-    Create and add implicit expressions.
-
-    Implicit expressions are those not explicitly defined by the user
-    but instead are requisites of some specified functionality.
-
-    Currently, implicit expressions stem from the following:
-
-        * ``SubDomainSet``'s attached to input equations.
-    """
-    found = {}
-    processed = []
-    for e in expressions:
-        if e.subdomain:
-            try:
-                dims = [d.root for d in e.free_symbols if isinstance(d, Dimension)]
-                sub_dims = [d.root for d in e.subdomain.dimensions]
-                sub_dims.append(e.subdomain.implicit_dimension)
-                dims = [d for d in dims if d not in frozenset(sub_dims)]
-                dims.append(e.subdomain.implicit_dimension)
-                if e.subdomain not in found:
-                    grid = list(retrieve_functions(e, mode='unique'))[0].grid
-                    found[e.subdomain] = [i.func(*i.args, implicit_dims=dims) for i in
-                                          e.subdomain._create_implicit_exprs(grid)]
-                processed.extend(found[e.subdomain])
-                dims.extend(e.subdomain.dimensions)
-                new_e = Eq(e.lhs, e.rhs, subdomain=e.subdomain, implicit_dims=dims)
-                processed.append(new_e)
-            except AttributeError:
-                processed.append(e)
-        else:
-            processed.append(e)
-    return processed
-
-
 def lower_exprs(expressions, **kwargs):
     """
     Lowering an expression consists of the following passes:
@@ -130,8 +103,8 @@ def lower_exprs(expressions, **kwargs):
             dimension_map = {}
 
         # Handle Functions (typical case)
-        mapper = {f: f.indexify(lshift=True, subs=dimension_map)
-                  for f in retrieve_functions(expr)}
+        mapper = {f: lower_exprs(f.indexify(subs=dimension_map), **kwargs)
+                  for f in expr.find(AbstractFunction)}
 
         # Handle Indexeds (from index notation)
         for i in retrieve_indexed(expr):
@@ -156,6 +129,7 @@ def lower_exprs(expressions, **kwargs):
         mapper.update(dimension_map)
         # Add the user-supplied substitutions
         mapper.update(subs)
+        # Apply mapper to expression
         processed.append(uxreplace(expr, mapper))
 
     if isinstance(expressions, Iterable):

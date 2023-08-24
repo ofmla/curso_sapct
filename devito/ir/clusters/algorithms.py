@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from functools import partial
 from itertools import groupby
 
@@ -5,23 +6,27 @@ import numpy as np
 import sympy
 
 from devito.exceptions import InvalidOperator
-from devito.ir.support import Any, Backward, Forward, IterationSpace
+from devito.ir.support import (Any, Backward, Forward, IterationSpace,
+                               PARALLEL_IF_ATOMIC, pull_dims)
 from devito.ir.clusters.analysis import analyze
 from devito.ir.clusters.cluster import Cluster, ClusterGroup
-from devito.ir.clusters.queue import Queue, QueueStateful
-from devito.symbolics import uxreplace, xreplace_indices
-from devito.tools import DefaultOrderedDict, as_mapper, flatten, is_integer, timed_pass
-from devito.types import ModuloDimension
+from devito.ir.clusters.visitors import Queue, QueueStateful, cluster_pass
+from devito.mpi.halo_scheme import HaloScheme, HaloTouch
+from devito.symbolics import retrieve_indexed, uxreplace, xreplace_indices
+from devito.tools import (DefaultOrderedDict, Stamp, as_mapper, flatten,
+                          is_integer, timed_pass)
+from devito.types import Array, Eq, Symbol
+from devito.types.dimension import BOTTOM, ModuloDimension
 
 __all__ = ['clusterize']
 
 
-def clusterize(exprs):
+def clusterize(exprs, **kwargs):
     """
     Turn a sequence of LoweredEqs into a sequence of Clusters.
     """
     # Initialization
-    clusters = [Cluster(e, e.ispace, e.dspace) for e in exprs]
+    clusters = [Cluster(e, e.ispace) for e in exprs]
 
     # Setup the IterationSpaces based on data dependence analysis
     clusters = Schedule().process(clusters)
@@ -34,6 +39,12 @@ def clusterize(exprs):
 
     # Determine relevant computational properties (e.g., parallelism)
     clusters = analyze(clusters)
+
+    # Input normalization (e.g., SSA)
+    clusters = normalize(clusters, **kwargs)
+
+    # Derive the necessary communications for distributed-memory parallelism
+    clusters = Communications().process(clusters)
 
     return ClusterGroup(clusters)
 
@@ -67,7 +78,7 @@ class Schedule(QueueStateful):
           scheduled to different loop nests.
 
         * If *all* dependences across two Clusters along a given Dimension are
-          backward carried depedences, then the IterationSpaces are _lifted_
+          backward carried dependences, then the IterationSpaces are _lifted_
           such that the two Clusters cannot be fused. This is to maximize
           the number of parallel Dimensions. Essentially, this is what low-level
           compilers call "loop fission" -- only that here it occurs at a much
@@ -83,7 +94,7 @@ class Schedule(QueueStateful):
 
     @timed_pass(name='schedule')
     def process(self, clusters):
-        return self._process_fdta(clusters, 1)
+        return self._process_fatd(clusters, 1)
 
     def callback(self, clusters, prefix, backlog=None, known_break=None):
         if not prefix:
@@ -138,12 +149,12 @@ class Schedule(QueueStateful):
         # Handle the backlog -- the Clusters characterized by flow- and anti-dependences
         # along one or more Dimensions
         idir = {d: Any for d in known_break}
+        stamp = Stamp()
         for i, c in enumerate(list(backlog)):
-            ispace = IterationSpace(c.ispace.intervals.lift(known_break),
+            ispace = IterationSpace(c.ispace.intervals.lift(known_break, stamp),
                                     c.ispace.sub_iterators,
                                     {**c.ispace.directions, **idir})
-            dspace = c.dspace.lift(known_break)
-            backlog[i] = c.rebuild(ispace=ispace, dspace=dspace)
+            backlog[i] = c.rebuild(ispace=ispace)
 
         return processed + self.callback(backlog, prefix)
 
@@ -178,16 +189,45 @@ def guard(clusters):
                 processed.append(c.rebuild(exprs=exprs))
                 continue
 
-            # Chain together all conditions from all expressions in `c`
+            # Separate out the indirect ConditionalDimensions, which only serve
+            # the purpose of protecting from OOB accesses
+            cds = [d for d in cds if not d.indirect]
+
+            # Chain together all `cds` conditions from all expressions in `c`
             guards = {}
             for cd in cds:
-                condition = guards.setdefault(cd.parent, [])
+                # `BOTTOM` parent implies a guard that lives outside of
+                # any iteration space, which corresponds to the placeholder None
+                if cd.parent is BOTTOM:
+                    d = None
+                else:
+                    d = cd.parent
+
+                # If `cd` uses, as condition, an arbitrary SymPy expression, then
+                # we must ensure to nest it inside the last of the Dimensions
+                # appearing in `cd.condition`
+                if cd._factor is not None:
+                    k = d
+                else:
+                    dims = pull_dims(cd.condition)
+                    k = max(dims, default=d, key=lambda i: c.ispace.index(i))
+
+                # Pull `cd` from any expr
+                condition = guards.setdefault(k, [])
                 for e in exprs:
                     try:
                         condition.append(e.conditionals[cd])
                         break
                     except KeyError:
                         pass
+
+                # Remove `cd` from all `exprs` since this will be now encoded
+                # globally at the Cluster level
+                for i, e in enumerate(list(exprs)):
+                    conditionals = dict(e.conditionals)
+                    conditionals.pop(cd, None)
+                    exprs[i] = e.func(*e.args, conditionals=conditionals)
+
             guards = {d: sympy.And(*v, evaluate=False) for d, v in guards.items()}
 
             # Construct a guarded Cluster
@@ -203,16 +243,13 @@ class Stepper(Queue):
     sub-iterators induced by a SteppingDimension.
     """
 
-    def process(self, clusters):
-        return self._process_fdta(clusters, 1)
-
     def callback(self, clusters, prefix):
         if not prefix:
             return clusters
 
         d = prefix[-1].dim
 
-        subiters = flatten([c.ispace.sub_iterators.get(d, []) for c in clusters])
+        subiters = flatten([c.ispace.sub_iterators[d] for c in clusters])
         subiters = {i for i in subiters if i.is_Stepping}
         if not subiters:
             return clusters
@@ -221,7 +258,7 @@ class Stepper(Queue):
         # a SteppingDimension for `d = time`
         mapper = DefaultOrderedDict(lambda: DefaultOrderedDict(set))
         for c in clusters:
-            indexeds = [a.indexed for a in c.scope.accesses if a.function.is_Tensor]
+            indexeds = c.scope.indexeds
 
             for i in indexeds:
                 try:
@@ -262,7 +299,7 @@ class Stepper(Queue):
         def rule(size, e):
             try:
                 return e.function.shape_allocated[d] == size
-            except (AttributeError, KeyError):
+            except (AttributeError, KeyError, ValueError):
                 return False
 
         # Reconstruct the Clusters
@@ -278,16 +315,177 @@ class Stepper(Queue):
             exprs = c.exprs
             groups = as_mapper(mds, lambda d: d.modulo)
             for size, v in groups.items():
-                mapper = {md.origin: md for md in v}
-
-                func = partial(xreplace_indices, mapper=mapper, key=partial(rule, size))
+                subs = {md.origin: md for md in v}
+                func = partial(xreplace_indices, mapper=subs, key=partial(rule, size))
                 exprs = [e.apply(func) for e in exprs]
 
             # Augment IterationSpace
-            ispace = IterationSpace(c.ispace.intervals,
-                                    {**c.ispace.sub_iterators, **{d: tuple(mds)}},
+            sub_iterators = dict(c.ispace.sub_iterators)
+            sub_iterators[d] = tuple(i for i in sub_iterators[d] + tuple(mds)
+                                     if i not in subiters)
+            ispace = IterationSpace(c.ispace.intervals, sub_iterators,
                                     c.ispace.directions)
 
             processed.append(c.rebuild(exprs=exprs, ispace=ispace))
 
         return processed
+
+
+class Communications(Queue):
+
+    """
+    Enrich a sequence of Clusters by adding special Clusters representing data
+    communications, or "halo exchanges", for distributed parallelism.
+    """
+
+    _q_guards_in_key = True
+    _q_properties_in_key = True
+
+    B = Symbol(name='⊥')
+
+    @timed_pass(name='schedule')
+    def process(self, clusters):
+        return self._process_fatd(clusters, 1, seen=set())
+
+    def callback(self, clusters, prefix, seen=None):
+        if seen.issuperset(clusters):
+            return clusters
+
+        d = prefix[-1].dim
+
+        # Construct the mock exprs representing the halo accesses
+        exprs = []
+        for c in clusters:
+            if c.properties.is_sequential(d):
+                continue
+
+            halo_scheme = HaloScheme(c.exprs, c.ispace)
+
+            if not halo_scheme.is_void and \
+               c.properties.is_parallel_relaxed(d):
+                points = set()
+                for f in halo_scheme.fmapper:
+                    for a in c.scope.getreads(f):
+                        points.add(a.access)
+
+                # We also add all written symbols to ultimately create mock WARs
+                # with `c`, which will prevent the newly created HaloTouch to ever
+                # be rescheduled after `c` upon topological sorting
+                points.update(a.access for a in c.scope.accesses if a.is_write)
+
+                # Sort for determinism
+                # NOTE: not sorting might impact code generation. The order of
+                # the args is important because that's what search functions honor!
+                points = sorted(points, key=str)
+
+                rhs = HaloTouch(*points, halo_scheme=halo_scheme)
+
+                # Insert only if not redundant, to avoid useless pollution
+                if not any(rhs == e.rhs for e in exprs):
+                    exprs.append(Eq(self.B, rhs))
+
+        processed = []
+        if exprs:
+            ispace = prefix[:prefix.index(d)]
+            properties = prefix.properties.drop(d)
+
+            processed.append(Cluster(exprs, ispace, c.guards, properties))
+            seen.update(clusters)
+
+        processed.extend(clusters)
+
+        return processed
+
+
+def normalize(clusters, **kwargs):
+    options = kwargs['options']
+    sregistry = kwargs['sregistry']
+
+    clusters = normalize_nested_indexeds(clusters, sregistry)
+    clusters = normalize_reductions(clusters, sregistry, options)
+
+    return clusters
+
+
+@cluster_pass(mode='all')
+def normalize_nested_indexeds(cluster, sregistry):
+    """
+    Recursively extract nested Indexeds in to temporaries.
+    """
+
+    def pull_indexeds(expr, subs, mapper, parent=None):
+        for i in retrieve_indexed(expr):
+            if i in mapper:
+                continue
+
+            for e in i.indices:
+                pull_indexeds(e, subs, mapper, parent=i)
+
+            if parent is not None:
+                # Nested Indexed, requires a temporary
+                k = i.xreplace(mapper)
+                v = Symbol(name=sregistry.make_name(), dtype=i.function.dtype)
+                subs[k] = v
+
+                # Update substitution status
+                mapper[i] = v
+
+    processed = []
+    for e in cluster.exprs:
+        subs = OrderedDict()
+        pull_indexeds(e, subs, {})
+
+        # Construct temporaries and apply substitution to `e`, in cascade
+        for k, v in subs.items():
+            processed.append(Eq(v, k))
+            e = e.xreplace({k: v})
+        processed.append(e)
+
+    return cluster.rebuild(processed)
+
+
+@cluster_pass(mode='all')
+def normalize_reductions(cluster, sregistry, options):
+    """
+    Extract the right-hand sides of reduction Eq's in to temporaries.
+    """
+    opt_mapify_reduce = options['mapify-reduce']
+
+    dims = [d for d, v in cluster.properties.items() if PARALLEL_IF_ATOMIC in v]
+
+    if not dims:
+        return cluster
+
+    processed = []
+    for e in cluster.exprs:
+        if e.is_Reduction and e.lhs.is_Indexed and cluster.is_sparse:
+            # Transform `e` such that we reduce into a scalar (ultimately via
+            # atomic ops, though this part is carried out by a much later pass)
+            # For example, given `i = m[p_src]` (i.e., indirection array), turn:
+            # `u[t, i] += f(u[t, i], src, ...)`
+            # into
+            # `s = f(u[t, i], src, ...)`
+            # `u[t, i] += s`
+            name = sregistry.make_name()
+            v = Symbol(name=name, dtype=e.dtype)
+            processed.extend([e.func(v, e.rhs, operation=None),
+                              e.func(e.lhs, v)])
+
+        elif e.is_Reduction and e.lhs.is_Symbol and opt_mapify_reduce:
+            # Transform `e` into what is in essence an explicit map-reduce
+            # For example, turn:
+            # `s += f(u[x], v[x], ...)`
+            # into
+            # `r[x] = f(u[x], v[x], ...)`
+            # `s += r[x]`
+            # This makes it much easier to parallelize the map part regardless
+            # of the target backend
+            name = sregistry.make_name()
+            a = Array(name=name, dtype=e.dtype, dimensions=dims)
+            processed.extend([Eq(a.indexify(), e.rhs),
+                              e.func(e.lhs, a.indexify())])
+
+        else:
+            processed.append(e)
+
+    return cluster.rebuild(processed)

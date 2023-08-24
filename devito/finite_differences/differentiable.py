@@ -1,18 +1,23 @@
 from collections import ChainMap
+from itertools import product
 from functools import singledispatch
 
+from cached_property import cached_property
+import numpy as np
 import sympy
+from sympy.core.add import _addsort
+from sympy.core.mul import _keep_coeff, _mulsort
 from sympy.core.decorators import call_highest_priority
 from sympy.core.evalf import evalf_table
 
-from cached_property import cached_property
 from devito.finite_differences.tools import make_shift_x0
 from devito.logger import warning
-from devito.tools import filter_ordered, flatten
-from devito.types.lazy import Evaluable
-from devito.types.utils import DimensionTuple
+from devito.tools import (as_tuple, filter_ordered, flatten, frozendict,
+                          infer_dtype, is_integer, split)
+from devito.types import (Array, DimensionTuple, Evaluable, Indexed, Spacing,
+                          StencilDimension)
 
-__all__ = ['Differentiable']
+__all__ = ['Differentiable', 'IndexDerivative', 'EvalDerivative', 'Weights']
 
 
 class Differentiable(sympy.Expr, Evaluable):
@@ -26,7 +31,7 @@ class Differentiable(sympy.Expr, Evaluable):
     # operators to be used
     _op_priority = sympy.Expr._op_priority + 1.
 
-    _state = ('space_order', 'time_order', 'indices')
+    __rkwargs__ = ('space_order', 'time_order', 'indices')
 
     @cached_property
     def _functions(self):
@@ -59,6 +64,11 @@ class Differentiable(sympy.Expr, Evaluable):
             return grids.pop()
         except KeyError:
             return None
+
+    @cached_property
+    def dtype(self):
+        dtypes = {f.dtype for f in self.find(Indexed)} - {None}
+        return infer_dtype(dtypes)
 
     @cached_property
     def indices(self):
@@ -111,9 +121,9 @@ class Differentiable(sympy.Expr, Evaluable):
         return self.func(*[getattr(a, '_eval_at', lambda x: a)(func) for a in self.args])
 
     def _subs(self, old, new, **hints):
-        if old is self:
+        if old == self:
             return new
-        if old is new:
+        if old == new:
             return self
         args = list(self.args)
         for i, arg in enumerate(args):
@@ -218,8 +228,12 @@ class Differentiable(sympy.Expr, Evaluable):
         return Mul(sympy.S.NegativeOne, self)
 
     def __eq__(self, other):
-        return super(Differentiable, self).__eq__(other) and\
-            all(getattr(self, i, None) == getattr(other, i, None) for i in self._state)
+        ret = super(Differentiable, self).__eq__(other)
+        if ret is NotImplemented or not ret:
+            # Non comparable or not equal as sympy objects
+            return False
+        return all(getattr(self, i, None) == getattr(other, i, None)
+                   for i in self.__rkwargs__)
 
     @property
     def name(self):
@@ -275,19 +289,36 @@ class Differentiable(sympy.Expr, Evaluable):
         from devito.finite_differences.derivative import Derivative
         return Derivative(self, *symbols, **assumptions)
 
-    def _has(self, pattern):
+    def has(self, *pattern):
         """
-        Unlike generic SymPy use cases, in Devito the majority of calls to `_has`
+        Unlike generic SymPy use cases, in Devito the majority of calls to `has`
         occur through the finite difference routines passing `sympy.core.symbol.Symbol`
         as `pattern`. Since the generic `_has` can be prohibitively expensive,
-        we here quickly handle this special case, while using the superclass' `_has`
+        we here quickly handle this special case, while using the superclass' `has`
         as fallback.
         """
-        if isinstance(pattern, type) and issubclass(pattern, sympy.Symbol):
-            # Symbols (and subclasses) are the leaves of an expression, and they
-            # are promptly available via `free_symbols`. So this is super quick
-            return any(isinstance(i, pattern) for i in self.free_symbols)
-        return super(Differentiable, self)._has(pattern)
+        for p in pattern:
+            # Following sympy convention, return True if any is found
+            if isinstance(p, type) and issubclass(p, sympy.Symbol):
+                # Symbols (and subclasses) are the leaves of an expression, and they
+                # are promptly available via `free_symbols`. So this is super quick
+                if any(isinstance(i, p) for i in self.free_symbols):
+                    return True
+        return super().has(*pattern)
+
+    def has_free(self, *patterns):
+        """
+        Return True if self has object(s) `patterns` as a free expression,
+        False otherwise.
+
+        Notes
+        -----
+        This is overridden in SymPy 1.10, but not in previous versions.
+        """
+        try:
+            return super().has_free(*patterns)
+        except AttributeError:
+            return all(i in self.free_symbols for i in patterns)
 
 
 def highest_priority(DiffOp):
@@ -300,6 +331,11 @@ class DifferentiableOp(Differentiable):
     __sympy_class__ = None
 
     def __new__(cls, *args, **kwargs):
+        # Do not re-evaluate if any of the args is an EvalDerivative,
+        # since the integrity of these objects must be preserved
+        if any(isinstance(i, EvalDerivative) for i in args):
+            kwargs['evaluate'] = False
+
         obj = cls.__base__.__new__(cls, *args, **kwargs)
 
         # Unfortunately SymPy may build new sympy.core objects (e.g., sympy.Add),
@@ -353,22 +389,76 @@ class DifferentiableFunction(DifferentiableOp):
     def __new__(cls, *args, **kwargs):
         return cls.__sympy_class__.__new__(cls, *args, **kwargs)
 
-    @property
-    def evaluate(self):
-        return self.func(*[getattr(a, 'evaluate', a) for a in self.args])
-
     def _eval_at(self, func):
         return self
 
 
 class Add(DifferentiableOp, sympy.Add):
     __sympy_class__ = sympy.Add
-    __new__ = DifferentiableOp.__new__
+
+    def __new__(cls, *args, **kwargs):
+        # Here, often we get `evaluate=False` to prevent SymPy evaluation (e.g.,
+        # when `cls==EvalDerivative`), but in all cases we at least apply a small
+        # set of basic simplifications
+
+        # (a+b)+c -> a+b+c (flattening)
+        nested, others = split(args, lambda e: isinstance(e, Add))
+        args = flatten(e.args for e in nested) + list(others)
+
+        # a+0 -> a
+        args = [i for i in args if i != 0]
+
+        # Reorder for homogeneity with pure SymPy types
+        _addsort(args)
+
+        return super().__new__(cls, *args, **kwargs)
 
 
 class Mul(DifferentiableOp, sympy.Mul):
     __sympy_class__ = sympy.Mul
-    __new__ = DifferentiableOp.__new__
+
+    def __new__(cls, *args, **kwargs):
+        # A Mul, being a DifferentiableOp, may not trigger evaluation upon
+        # construction (e.g., when an EvalDerivative is present among its
+        # arguments), so here we apply a small set of basic simplifications
+        # to avoid generating functional, but ugly, code
+
+        # (a*b)*c -> a*b*c (flattening)
+        nested, others = split(args, lambda e: isinstance(e, Mul))
+        args = flatten(e.args for e in nested) + list(others)
+
+        # a*0 -> 0
+        if any(i == 0 for i in args):
+            return sympy.S.Zero
+
+        # a*1 -> a
+        args = [i for i in args if i != 1]
+
+        # a*-1 -> a*-1
+        # a*-1*-1 -> a
+        # a*-1*-1*-1 -> a*-1
+        nminus = len([i for i in args if i == sympy.S.NegativeOne])
+        args = [i for i in args if i != sympy.S.NegativeOne]
+        if nminus % 2 == 1:
+            args.append(sympy.S.NegativeOne)
+
+        # Reorder for homogeneity with pure SymPy types
+        _mulsort(args)
+
+        # `sympy.Mul.flatten(coeff, Add)` flattens out nested Adds within Add,
+        # which would destroy `EvalDerivative`s if present. So here we perform
+        # a similar thing, but cautiously construct an evaluated Add, which
+        # will preserve the integrity of `EvalDerivative`s, if any
+        try:
+            a, b = args
+            if a.is_Rational:
+                r, b = b.as_coeff_Mul()
+                if r is sympy.S.One and type(b) is Add:
+                    return Add(*[_keep_coeff(a, bi) for bi in b.args], evaluate=False)
+        except (AttributeError, ValueError):
+            pass
+
+        return super().__new__(cls, *args, **kwargs)
 
     @property
     def _gather_for_diff(self):
@@ -411,17 +501,235 @@ class Mul(DifferentiableOp, sympy.Mul):
 class Pow(DifferentiableOp, sympy.Pow):
     _fd_priority = 0
     __sympy_class__ = sympy.Pow
-    __new__ = DifferentiableOp.__new__
 
 
 class Mod(DifferentiableOp, sympy.Mod):
     __sympy_class__ = sympy.Mod
-    __new__ = DifferentiableOp.__new__
+
+
+class IndexSum(DifferentiableOp):
+
+    """
+    Represent the summation over a multiindex, that is a collection of
+    Dimensions, of an indexed expression.
+    """
+
+    __rargs__ = ('expr', 'dimensions')
+
+    is_commutative = True
+
+    def __new__(cls, expr, dimensions, **kwargs):
+        dimensions = as_tuple(dimensions)
+        if not dimensions:
+            return expr
+        for d in dimensions:
+            try:
+                if d.is_Dimension and is_integer(d.symbolic_size):
+                    continue
+            except AttributeError:
+                pass
+            raise ValueError("Expected Dimension with numeric size, "
+                             "got `%s` instead" % d)
+
+        # TODO: `has_free` only available with SymPy v>=1.10
+        # We should start using `not expr.has_free(*dimensions)` once we drop
+        # support for SymPy 1.8<=v<1.0
+        if not all(d in expr.free_symbols for d in dimensions):
+            raise ValueError("All Dimensions `%s` must appear in `expr` "
+                             "as free variables" % str(dimensions))
+
+        for i in expr.find(IndexSum):
+            for d in dimensions:
+                if d in i.dimensions:
+                    raise ValueError("Dimension `%s` already appears in a "
+                                     "nested tensor contraction" % d)
+
+        obj = sympy.Expr.__new__(cls, expr)
+        obj._expr = expr
+        obj._dimensions = dimensions
+
+        return obj
+
+    def __repr__(self):
+        return "%s(%s, (%s))" % (self.__class__.__name__, self.expr,
+                                 ', '.join(d.name for d in self.dimensions))
+
+    __str__ = __repr__
+
+    def _hashable_content(self):
+        return super()._hashable_content() + (self.dimensions,)
+
+    @property
+    def expr(self):
+        return self._expr
+
+    @property
+    def dimensions(self):
+        return self._dimensions
+
+    def _evaluate(self, **kwargs):
+        expr = self.expr._evaluate(**kwargs)
+
+        if not kwargs.get('expand', True):
+            return self.func(expr, self.dimensions)
+
+        values = product(*[list(d.range) for d in self.dimensions])
+        terms = []
+        for i in values:
+            mapper = dict(zip(self.dimensions, i))
+            terms.append(expr.xreplace(mapper))
+        return sum(terms)
+
+    @property
+    def free_symbols(self):
+        return super().free_symbols - set(self.dimensions)
+
+    func = DifferentiableOp._rebuild
+
+
+class Weights(Array):
+
+    """
+    The weights (or coefficients) of a finite-difference expansion.
+    """
+
+    def __init_finalize__(self, *args, **kwargs):
+        dimensions = as_tuple(kwargs.get('dimensions'))
+        weights = kwargs.get('initvalue')
+
+        assert len(dimensions) == 1
+        d = dimensions[0]
+        assert isinstance(d, StencilDimension) and d.symbolic_size == len(weights)
+        assert isinstance(weights, (list, tuple, np.ndarray))
+
+        try:
+            self._spacings = set().union(*[i.find(Spacing) for i in weights])
+        except AttributeError:
+            self._spacing = set()
+
+        kwargs['scope'] = 'constant'
+
+        super().__init_finalize__(*args, **kwargs)
+
+    def __eq__(self, other):
+        return (isinstance(other, Weights) and
+                self.name == other.name and
+                self.dimension == other.dimension and
+                self.indices == other.indices and
+                self.weights == other.weights)
+
+    __hash__ = sympy.Basic.__hash__
+
+    def _hashable_content(self):
+        return (self.name, self.dimension, hash(tuple(self.weights)))
+
+    @property
+    def dimension(self):
+        return self.dimensions[0]
+
+    @property
+    def spacings(self):
+        return self._spacings
+
+    weights = Array.initvalue
+
+
+class IndexDerivative(IndexSum):
+
+    __rargs__ = ('expr', 'mapper')
+
+    def __new__(cls, expr, mapper, **kwargs):
+        dimensions = as_tuple(mapper.values())
+
+        # Detect the Weights among the arguments
+        weightss = []
+        for a in expr.args:
+            try:
+                f = a.function
+            except AttributeError:
+                continue
+            if isinstance(f, Weights):
+                weightss.append(a)
+
+        # Sanity check
+        if not (expr.is_Mul and len(weightss) == 1):
+            raise ValueError("Expect `expr*weights`, got `%s` instead" % str(expr))
+        weights = weightss.pop()
+
+        obj = super().__new__(cls, expr, dimensions)
+        obj._weights = weights
+        obj._mapper = frozendict(mapper)
+
+        return obj
+
+    def _hashable_content(self):
+        return super()._hashable_content() + (self.mapper,)
+
+    @property
+    def weights(self):
+        return self._weights
+
+    @property
+    def mapper(self):
+        return self._mapper
+
+    @property
+    def depth(self):
+        iderivs = self.expr.find(IndexDerivative)
+        return 1 + max([i.depth for i in iderivs], default=0)
+
+    def _evaluate(self, **kwargs):
+        expr = super()._evaluate(**kwargs)
+
+        if not kwargs.get('expand', True):
+            return expr
+
+        w = self.weights
+        f = w.function
+        d = w.dimension
+        mapper = {w.subs(d, i): f.weights[n] for n, i in enumerate(d.range)}
+        expr = expr.xreplace(mapper)
+
+        return expr
 
 
 class EvalDerivative(DifferentiableOp, sympy.Add):
-    __sympy_class__ = sympy.Add
-    __new__ = DifferentiableOp.__new__
+
+    is_commutative = True
+
+    __rkwargs__ = ('base',)
+
+    def __new__(cls, *args, base=None, **kwargs):
+        kwargs['evaluate'] = False
+
+        # a+0 -> a
+        args = [i for i in args if i != 0]
+
+        # Reorder for homogeneity with pure SymPy types
+        _addsort(args)
+
+        obj = super().__new__(cls, *args, **kwargs)
+
+        try:
+            obj.base = base
+        except AttributeError:
+            # This might happen if e.g. one attempts a (re)construction with
+            # one sole argument. The (re)constructed EvalDerivative degenerates
+            # to an object of different type, in classic SymPy style. That's fine
+            assert len(args) <= 1
+            assert not obj.is_Add
+            return obj
+
+        return obj
+
+    func = DifferentiableOp._rebuild
+
+    def _new_rawargs(self, *args, **kwargs):
+        kwargs.pop('is_commutative', None)
+        return self.func(*args, **kwargs)
+
+    def _coeff_symbol(self, *args, **kwargs):
+        return self.base._coeff_symbol(*args, **kwargs)
 
 
 class diffify(object):
@@ -502,8 +810,16 @@ def diff2sympy(expr):
         except AttributeError:
             # Not of type DifferentiableOp
             pass
+        except TypeError:
+            # Won't lower (e.g., EvalDerivative)
+            pass
         if flag:
-            return obj.func(*args, evaluate=False), True
+            try:
+                return obj.func(*args, evaluate=False), True
+            except TypeError:
+                # In case of indices using other Function, evaluate
+                # may not be a supported argument.
+                return obj.func(*args), True
         else:
             return obj, False
 
