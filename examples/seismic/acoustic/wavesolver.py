@@ -1,10 +1,8 @@
-from devito import Function, TimeFunction
+from devito import Function, TimeFunction, DevitoCheckpoint, CheckpointOperator, Revolver
 from devito.tools import memoized_meth
 from examples.seismic.acoustic.operators import (
     ForwardOperator, AdjointOperator, GradientOperator, BornOperator
 )
-from examples.checkpointing.checkpoint import DevitoCheckpoint, CheckpointOperator
-from pyrevolve import Revolver
 
 
 class AcousticWaveSolver(object):
@@ -114,6 +112,7 @@ class AcousticWaveSolver(object):
         # Execute operator and return wavefield and receiver data
         summary = self.op_fwd(save).apply(src=src, rec=rec, u=u,
                                           dt=kwargs.pop('dt', self.dt), **kwargs)
+
         return rec, u, summary
 
     def adjoint(self, rec, srca=None, v=None, model=None, **kwargs):
@@ -156,7 +155,7 @@ class AcousticWaveSolver(object):
                                       dt=kwargs.pop('dt', self.dt), **kwargs)
         return srca, v, summary
 
-    def jacobian_adjoint(self, rec, u, v=None, grad=None, model=None,
+    def jacobian_adjoint(self, rec, u, src=None, v=None, grad=None, model=None,
                          checkpointing=False, **kwargs):
         """
         Gradient modelling function for computing the adjoint of the
@@ -199,7 +198,8 @@ class AcousticWaveSolver(object):
                              time_order=2, space_order=self.space_order)
             cp = DevitoCheckpoint([u])
             n_checkpoints = None
-            wrap_fw = CheckpointOperator(self.op_fwd(save=False), src=self.geometry.src,
+            wrap_fw = CheckpointOperator(self.op_fwd(save=False),
+                                         src=src or self.geometry.src,
                                          u=u, dt=dt, **kwargs)
             wrap_rev = CheckpointOperator(self.op_grad(save=False), u=u, v=v,
                                           rec=rec, dt=dt, grad=grad, **kwargs)

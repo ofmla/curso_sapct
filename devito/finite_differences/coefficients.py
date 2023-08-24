@@ -1,10 +1,9 @@
-import sympy
 import numpy as np
 from cached_property import cached_property
 
 from devito.finite_differences import generate_indices
+from devito.finite_differences.tools import numeric_weights, symbolic_weights
 from devito.tools import filter_ordered, as_tuple
-from devito.symbolics.search import retrieve_dimensions
 
 __all__ = ['Coefficient', 'Substitutions', 'default_rules']
 
@@ -148,8 +147,8 @@ class Substitutions(object):
     check that by
 
     >>> eq.evaluate
-    Eq(0.1*u(t, x, y) - 0.6*u(t, x - h_x, y) + 0.6*u(t, x + h_x, y) \
-- u(t, x, y)/dt + u(t + dt, x, y)/dt, 0)
+    Eq(-u(t, x, y)/dt + u(t + dt, x, y)/dt + 0.1*u(t, x, y) - \
+0.6*u(t, x - h_x, y) + 0.6*u(t, x + h_x, y), 0)
 
     Notes
     -----
@@ -230,6 +229,8 @@ class Substitutions(object):
 
 def default_rules(obj, functions):
 
+    from devito.symbolics.search import retrieve_dimensions
+
     def generate_subs(deriv_order, function, index):
         dim = retrieve_dimensions(index)[0]
 
@@ -244,15 +245,25 @@ def default_rules(obj, functions):
         subs = {}
 
         mapper = {dim: index}
+        # Get full range of indices and weights
+        indices, x0 = generate_indices(function, dim,
+                                       fd_order, side=None, x0=mapper)
+        sweights = symbolic_weights(function, deriv_order, indices, x0)
+
+        # Actual FD used indices and weights
+        if deriv_order == 1 and fd_order == 2:
+            fd_order = 1
 
         indices, x0 = generate_indices(function, dim,
                                        fd_order, side=None, x0=mapper)
 
-        coeffs = sympy.finite_diff_weights(deriv_order, indices, x0)[-1][-1]
+        coeffs = numeric_weights(deriv_order, indices, x0)
 
-        for j in range(len(coeffs)):
-            subs.update({function._coeff_symbol
-                        (indices[j], deriv_order, function, index): coeffs[j]})
+        for (c, i) in zip(coeffs, indices):
+            subs.update({function._coeff_symbol(i, deriv_order, function, index): c})
+
+        # Set all unused weights to zero
+        subs.update({w: 0 for w in sweights if w not in subs})
 
         return subs
 

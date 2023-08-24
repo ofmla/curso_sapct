@@ -1,12 +1,14 @@
+from .utils import *  # noqa
+
 # Need only from within Devito
 from .basic import *  # noqa
 from .array import *  # noqa
+from .object import *  # noqa
 from .lazy import *  # noqa
 from .misc import *  # noqa
 
 # Needed both within and outside Devito
 from .dimension import *  # noqa
-from .utils import *  # noqa
 from .caching import _SymbolCache, CacheManager  # noqa
 from .equation import *  # noqa
 from .constant import *  # noqa

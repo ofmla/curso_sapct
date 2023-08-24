@@ -1,22 +1,32 @@
 """Collection of utilities to detect properties of the underlying architecture."""
 
-from subprocess import PIPE, Popen, DEVNULL
+from subprocess import PIPE, Popen, DEVNULL, run
 
 from cached_property import cached_property
 import cpuinfo
+import ctypes
 import numpy as np
 import psutil
 import re
+import os
+import sys
 
 from devito.logger import warning
-from devito.tools import all_equal, memoized_func
+from devito.tools import as_tuple, all_equal, memoized_func
 
-__all__ = ['platform_registry', 'get_cpu_info', 'get_gpu_info',
-           'Platform', 'Cpu64', 'Intel64', 'Amd', 'Arm', 'Power', 'Device',
-           'NvidiaDevice', 'AmdDevice',
-           'INTEL64', 'SNB', 'IVB', 'HSW', 'BDW', 'SKX', 'KNL', 'KNL7210',  # Intel
-           'AMD', 'ARM', 'POWER8', 'POWER9',  # Other CPU architectures
-           'AMDGPUX', 'NVIDIAX']  # GPUs
+__all__ = ['platform_registry', 'get_cpu_info', 'get_gpu_info', 'get_nvidia_cc',
+           'get_cuda_path', 'get_hip_path', 'check_cuda_runtime', 'get_m1_llvm_path',
+           'Platform', 'Cpu64', 'Intel64', 'IntelSkylake', 'Amd', 'Arm', 'Power',
+           'Device', 'NvidiaDevice', 'AmdDevice', 'IntelDevice',
+           # Intel
+           'INTEL64', 'SNB', 'IVB', 'HSW', 'BDW', 'KNL', 'KNL7210',
+           'SKX', 'KLX', 'CLX', 'CLK', 'SPR',
+           # ARM
+           'AMD', 'ARM', 'M1', 'GRAVITON',
+           # Other loosely supported CPU architectures
+           'POWER8', 'POWER9',
+           # GPUs
+           'AMDGPUX', 'NVIDIAX', 'INTELGPUX']
 
 
 @memoized_func
@@ -73,10 +83,19 @@ def get_cpu_info():
         cpu_info['brand'] = get_cpu_brand()
 
     if not cpu_info.get('flags'):
-        cpu_info['flags'] = cpuinfo.get_cpu_info().get('flags')
+        try:
+            cpu_info['flags'] = cpuinfo.get_cpu_info().get('flags')
+        except:
+            # We've rarely seen cpuinfo>=8 raising exceptions at this point,
+            # while trying to fetch the cpu `flags`
+            cpu_info['flags'] = None
 
     if not cpu_info.get('brand'):
-        cpu_info['brand'] = cpuinfo.get_cpu_info().get('brand')
+        try:
+            ret = cpuinfo.get_cpu_info()
+            cpu_info['brand'] = ret.get('brand', ret.get('brand_raw'))
+        except:
+            cpu_info['brand'] = None
 
     # Detect number of logical cores
     logical = psutil.cpu_count(logical=True)
@@ -142,16 +161,101 @@ def get_gpu_info():
             return 'virtual' not in gpu['product'].lower()
         return list(filter(is_real_gpu, gpus))
 
-    # The following functions of the form cmd_gpu_info(...) attempt obtaining GPU
-    #   information using 'cmd'
-    # The currently supported ways of obtaining GPU information (in order of attempt) are:
-    #   - 'lshw' from the command line
-    #   - 'lspci' from the command line
+    def homogenise_gpus(gpu_infos):
+        """
+        Run homogeneity checks on a list of GPUs, return GPU with count if
+        homogeneous, otherwise None.
+        """
+        if gpu_infos == []:
+            warning('No graphics cards detected')
+            return {}
 
-    def lshw_gpu_info(text):
-        def lshw_single_gpu_info(text):
+        # Check must ignore physical IDs as they may differ
+        for gpu_info in gpu_infos:
+            gpu_info.pop('physicalid', None)
+
+        if all_equal(gpu_infos):
+            gpu_infos[0]['ncards'] = len(gpu_infos)
+            return gpu_infos[0]
+
+        warning('Different models of graphics cards detected')
+
+        return {}
+
+    # Parse textual gpu info into a dict
+
+    # *** First try: `nvidia-smi`, clearly only works with NVidia cards
+    try:
+        gpu_infos = []
+
+        info_cmd = ['nvidia-smi', '-L']
+        proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
+        raw_info = str(proc.stdout.read())
+
+        lines = raw_info.replace('\\n', '\n').replace('b\'', '')
+        lines = lines.splitlines()
+
+        for line in lines:
+            gpu_info = {}
+            if 'GPU' in line:
+                gpu_info = {}
+                match = re.match(r'GPU *[0-9]*\: ([\w]*) (.*) \(', line)
+                if match:
+                    if match.group(1) == 'Graphics':
+                        gpu_info['architecture'] = 'unspecified'
+                    else:
+                        gpu_info['architecture'] = match.group(1)
+                    if match.group(2) == 'Device':
+                        gpu_info['product'] = 'unspecified'
+                    else:
+                        gpu_info['product'] = match.group(2)
+                    gpu_info['vendor'] = 'NVIDIA'
+                    gpu_infos.append(gpu_info)
+
+        gpu_info = homogenise_gpus(gpu_infos)
+
+        # Also attach callbacks to retrieve instantaneous memory info
+        for i in ['total', 'free', 'used']:
+            def make_cbk(i):
+                def cbk(deviceid=0):
+                    info_cmd = ['nvidia-smi', '--query-gpu=memory.%s' % i, '--format=csv']
+                    proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
+                    raw_info = str(proc.stdout.read())
+
+                    lines = raw_info.replace('\\n', '\n').replace('b\'', '')
+                    lines = lines.splitlines()[1:-1]
+
+                    try:
+                        line = lines.pop(deviceid)
+                        _, v, unit = re.split(r'([0-9]+)\s', line)
+                        assert unit == 'MiB'
+                        return int(v)*10**6
+                    except:
+                        # We shouldn't really end up here, unless nvidia-smi changes
+                        # the output format (though we still have tests in place that
+                        # will catch this)
+                        return None
+
+                    return lines
+
+                return cbk
+
+            gpu_info['mem.%s' % i] = make_cbk(i)
+
+        return gpu_info
+
+    except OSError:
+        pass
+
+    # *** Second try: `lshw`
+    try:
+        info_cmd = ['lshw', '-C', 'video']
+        proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
+        raw_info = str(proc.stdout.read())
+
+        def lshw_single_gpu_info(raw_info):
             # Separate the output into lines for processing
-            lines = text.replace('\\n', '\n')
+            lines = raw_info.replace('\\n', '\n')
             lines = lines.splitlines()
 
             # Define the processing functions
@@ -179,16 +283,26 @@ def get_gpu_info():
                 return gpu_info
 
         # Parse the information for all the devices listed with lshw
-        devices = text.split('display')[1:]
+        devices = raw_info.split('display')[1:]
         gpu_infos = [lshw_single_gpu_info(device) for device in devices]
-        return filter_real_gpus(gpu_infos)
+        gpu_infos = filter_real_gpus(gpu_infos)
 
-    def lspci_gpu_info(text):
+        return homogenise_gpus(gpu_infos)
+
+    except OSError:
+        pass
+
+    # Third try: `lspci`, which is more readable but less detailed than `lshw`
+    try:
+        info_cmd = ['lspci']
+        proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
+        raw_info = str(proc.stdout.read())
+
         # Note: due to the single line descriptive format of lspci, 'vendor'
-        #   and 'physicalid' elements cannot be reliably extracted so are left None
+        # and 'physicalid' elements cannot be reliably extracted so are left None
 
         # Separate the output into lines for processing
-        lines = text.replace('\\n', '\n')
+        lines = raw_info.replace('\\n', '\n')
         lines = lines.splitlines()
 
         gpu_infos = []
@@ -214,92 +328,129 @@ def get_gpu_info():
                     continue
 
                 gpu_infos.append(gpu_info)
-        return filter_real_gpus(gpu_infos)
 
-    def nvidiasmi_gpu_info(text):
-        lines = text.replace('\\n', '\n').replace('b\'', '')
-        lines = lines.splitlines()
+        gpu_infos = filter_real_gpus(gpu_infos)
 
-        gpu_infos = []
-        for line in lines:
-            gpu_info = {}
-            if 'GPU' in line:
-                gpu_info = {}
-                match = re.match(r'GPU *[0-9]*\: ([\w]*) (.*) \(', line)
-                if match:
-                    if match.group(1) == 'Graphics':
-                        gpu_info['architecture'] = 'unspecified'
-                    else:
-                        gpu_info['architecture'] = match.group(1)
-                    if match.group(2) == 'Device':
-                        gpu_info['product'] = 'unspecified'
-                    else:
-                        gpu_info['product'] = match.group(2)
-                    gpu_info['vendor'] = 'NVIDIA'
-                    gpu_infos.append(gpu_info)
-
-        return gpu_infos
-
-    # Run homogeneity checks on a list of GPU, return GPU with count if homogeneous,
-    #   otherwise None
-    def homogenise_gpus(gpu_infos):
-        if gpu_infos == []:
-            warning('No graphics cards detected')
-            return {}
-
-        # Check must ignore physical IDs as they may differ
-        for gpu_info in gpu_infos:
-            gpu_info.pop('physicalid', None)
-
-        if all_equal(gpu_infos):
-            gpu_infos[0]['ncards'] = len(gpu_infos)
-            return gpu_infos[0]
-
-        warning('Different models of graphics cards detected')
-
-        return {}
-
-    # Obtain textual gpu info and delegate parsing to helper functions
-
-    try:
-        # First try is with nvidia-smi, which can have more info about NVIDIA cards
-        info_cmd = ['nvidia-smi', '-L']
-        proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
-        raw_info = str(proc.stdout.read())
-
-        # Parse the information for all the devices listed with nvidia-smi
-        gpu_infos = nvidiasmi_gpu_info(raw_info)
-        return homogenise_gpus(gpu_infos)
-
-    except OSError:
-        pass
-
-    try:
-        # Second try is with detailed command lshw
-        info_cmd = ['lshw', '-C', 'video']
-        proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
-        raw_info = str(proc.stdout.read())
-
-        gpu_infos = lshw_gpu_info(raw_info)
-        return homogenise_gpus(gpu_infos)
-
-    except OSError:
-        pass
-
-    try:
-        # Third try is with lspci, which is more readable and less detailed than lshw
-        info_cmd = ['lspci']
-        proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
-        raw_info = str(proc.stdout.read())
-
-        # Parse the information for all the devices listed with lspci
-        gpu_infos = lspci_gpu_info(raw_info)
         return homogenise_gpus(gpu_infos)
 
     except OSError:
         pass
 
     return None
+
+
+@memoized_func
+def get_nvidia_cc():
+    libnames = ('libcuda.so', 'libcuda.dylib', 'cuda.dll')
+    for libname in libnames:
+        try:
+            cuda = ctypes.CDLL(libname)
+        except OSError:
+            continue
+        else:
+            break
+    else:
+        return None
+
+    cc_major = ctypes.c_int()
+    cc_minor = ctypes.c_int()
+
+    if cuda.cuInit(0) != 0:
+        return None
+    elif (cuda.cuDeviceComputeCapability(ctypes.byref(cc_major),
+          ctypes.byref(cc_minor), 0) == 0):
+        return 10*cc_major.value + cc_minor.value
+
+
+@memoized_func
+def get_cuda_path():
+    # *** First try: via commonly used environment variables
+    for i in ['CUDA_HOME', 'CUDA_ROOT']:
+        cuda_home = os.environ.get(i)
+        if cuda_home:
+            return cuda_home
+
+    # *** Second try: inspect the LD_LIBRARY_PATH
+    llp = os.environ.get('LD_LIBRARY_PATH', '')
+    for i in llp.split(':'):
+        if re.match('.*/nvidia/hpc_sdk/.*/compilers/lib', i):
+            cuda_home = os.path.join(os.path.dirname(os.path.dirname(i)), 'cuda')
+            # Sanity check
+            if os.path.exists(cuda_home):
+                return cuda_home
+
+    return None
+
+
+@memoized_func
+def get_hip_path():
+    # *** First try: via commonly used environment variables
+    for i in ['HIP_HOME']:
+        hip_home = os.environ.get(i)
+        if hip_home:
+            return hip_home
+
+    return None
+
+
+@memoized_func
+def get_m1_llvm_path(language):
+    # Check if Apple's llvm is installed (installable via Homebrew), which supports
+    # OpenMP.
+    # Check that we are on apple system
+    if sys.platform != 'darwin':
+        raise ValueError('Apple LLVM is only available on Mac OS X.')
+    # *** First check if LLVM is installed
+    ver = run(["clang", "--version"], stdout=PIPE, stderr=DEVNULL).stdout.decode("utf-8")
+    # *** Second check if this clang version targets arm64 (M1)
+    if "arm64-apple" in ver:
+        # *** Third extract install path. clang version command contains the line:
+        # InstalledDir: /path/to/llvm/bin
+        # which points to the llvm root directory we need for libraries and includes
+        prefix = [v.split(': ')[-1] for v in ver.split('\n')
+                  if "InstalledDir" in v][0][:-4]
+        # ** Fourth check if the libraries are installed
+        if os.path.exists(os.path.join(prefix, 'lib', 'libomp.dylib')):
+            libs = os.path.join(prefix, "lib")
+            include = os.path.join(prefix, "include")
+            return {'libs': libs, 'include': include}
+        elif language == "openmp":
+            warning("Apple's arm64 clang found but openmp libraries not found."
+                    "Install Apple LLVM for OpenMP support, i.e. `brew install llvm`")
+        else:
+            pass
+    else:
+        if language == "openmp":
+            warning("Apple's x86 clang found, OpenMP is not supported.")
+    return None
+
+
+@memoized_func
+def check_cuda_runtime():
+    libnames = ('libcudart.so', 'libcudart.dylib', 'cudart.dll')
+    for libname in libnames:
+        try:
+            cuda = ctypes.CDLL(libname)
+        except OSError:
+            continue
+        else:
+            break
+    else:
+        warning("Unable to check compatibility of NVidia driver and runtime")
+        return
+
+    driver_version = ctypes.c_int()
+    runtime_version = ctypes.c_int()
+
+    if cuda.cudaDriverGetVersion(ctypes.byref(driver_version)) == 0 and \
+       cuda.cudaRuntimeGetVersion(ctypes.byref(runtime_version)) == 0:
+        driver_version = driver_version.value
+        runtime_version = runtime_version.value
+        if driver_version < runtime_version:
+            warning("The NVidia driver (v%d) on this system may not be compatible "
+                    "with the CUDA runtime (v%d)" % (driver_version, runtime_version))
+    else:
+        warning("Unable to check compatibility of NVidia driver and runtime")
 
 
 @memoized_func
@@ -348,7 +499,7 @@ def get_platform():
             if 'phi' in brand:
                 # Intel Xeon Phi?
                 return platform_registry['knl']
-            # Unknown Xeon ? May happen on some virtualizes systems...
+            # Unknown Xeon ? May happen on some virtualized systems...
             return platform_registry['intel64']
         elif 'intel' in brand:
             # Most likely a desktop i3/i5/i7
@@ -359,6 +510,8 @@ def get_platform():
             return platform_registry['power8']
         elif 'arm' in brand:
             return platform_registry['arm']
+        elif 'm1' in brand:
+            return platform_registry['m1']
         elif 'amd' in brand:
             return platform_registry['amd']
     except:
@@ -370,14 +523,8 @@ def get_platform():
 
 class Platform(object):
 
-    def __init__(self, name, **kwargs):
+    def __init__(self, name):
         self.name = name
-
-        cpu_info = get_cpu_info()
-
-        self.cores_logical = kwargs.get('cores_logical', cpu_info['logical'])
-        self.cores_physical = kwargs.get('cores_physical', cpu_info['physical'])
-        self.isa = kwargs.get('isa', self._detect_isa())
 
     @classmethod
     def _mro(cls):
@@ -409,10 +556,28 @@ class Platform(object):
         assert self.simd_reg_size % np.dtype(dtype).itemsize == 0
         return int(self.simd_reg_size / np.dtype(dtype).itemsize)
 
+    @property
+    def memtotal(self):
+        """Physical memory size in bytes, or None if unknown."""
+        return None
+
+    def memavail(self, *args, **kwargs):
+        """Available physical memory in bytes, or None if unknown."""
+        return None
+
 
 class Cpu64(Platform):
 
-    # The known ISAs will be overwritten in the specialized classes
+    def __init__(self, name, cores_logical=None, cores_physical=None, isa=None):
+        super().__init__(name)
+
+        cpu_info = get_cpu_info()
+
+        self.cores_logical = cores_logical or cpu_info['logical']
+        self.cores_physical = cores_physical or cpu_info['physical']
+        self.isa = isa or self._detect_isa()
+
+    # The known ISAs are to be provided by the subclasses
     known_isas = ()
 
     @classmethod
@@ -428,16 +593,31 @@ class Cpu64(Platform):
 
     def _detect_isa(self):
         for i in reversed(self.known_isas):
-            if any(j.startswith(i) for j in get_cpu_info()['flags']):
+            if any(j.startswith(i) for j in as_tuple(get_cpu_info()['flags'])):
                 # Using `startswith`, rather than `==`, as a flag such as 'avx512'
                 # appears as 'avx512f, avx512cd, ...'
                 return i
         return 'cpp'
 
+    @cached_property
+    def memtotal(self):
+        return psutil.virtual_memory().total
+
+    def memavail(self, *args, **kwargs):
+        return psutil.virtual_memory().available
+
 
 class Intel64(Cpu64):
 
     known_isas = ('cpp', 'sse', 'avx', 'avx2', 'avx512')
+
+
+class IntelSkylake(Intel64):
+    pass
+
+
+class IntelGoldenCove(Intel64):
+    pass
 
 
 class Arm(Cpu64):
@@ -459,7 +639,7 @@ class Power(Cpu64):
 class Device(Platform):
 
     def __init__(self, name, cores_logical=1, cores_physical=1, isa='cpp'):
-        self.name = name
+        super().__init__(name)
 
         self.cores_logical = cores_logical
         self.cores_physical = cores_physical
@@ -479,6 +659,31 @@ class Device(Platform):
     @cached_property
     def march(self):
         return None
+
+    @cached_property
+    def memtotal(self):
+        info = get_gpu_info()
+        try:
+            return info['mem.total']()
+        except (AttributeError, KeyError):
+            return None
+
+    def memavail(self, deviceid=0):
+        """
+        The amount of memory currently available on device.
+        """
+        info = get_gpu_info()
+        try:
+            return info['mem.free'](deviceid)
+        except (AttributeError, KeyError):
+            return None
+
+
+class IntelDevice(Device):
+
+    @cached_property
+    def march(self):
+        return ''
 
 
 class NvidiaDevice(Device):
@@ -509,8 +714,12 @@ class AmdDevice(Device):
         #     mygpu will only print values accepted by cuda clang in
         #     the clang argument --cuda-gpu-arch.
         try:
-            p1 = Popen(['mygpu', '-d', 'gfx900'], stdout=PIPE, stderr=PIPE)
+            p1 = Popen(['offload-arch'], stdout=PIPE, stderr=PIPE)
         except OSError:
+            try:
+                p1 = Popen(['mygpu', '-d', fallback], stdout=PIPE, stderr=PIPE)
+            except OSError:
+                pass
             return fallback
 
         output, _ = p1.communicate()
@@ -523,24 +732,33 @@ class AmdDevice(Device):
 # CPUs
 CPU64 = Cpu64('cpu64')
 CPU64_DUMMY = Intel64('cpu64-dummy', cores_logical=2, cores_physical=1, isa='sse')
+
 INTEL64 = Intel64('intel64')
 SNB = Intel64('snb')
 IVB = Intel64('ivb')
 HSW = Intel64('hsw')
 BDW = Intel64('bdw', isa='avx2')
-SKX = Intel64('skx')
-KLX = Intel64('klx')
-CLX = Intel64('clx')
 KNL = Intel64('knl')
 KNL7210 = Intel64('knl', cores_logical=256, cores_physical=64, isa='avx512')
+SKX = IntelSkylake('skx')
+KLX = IntelSkylake('klx')
+CLX = IntelSkylake('clx')
+CLK = IntelSkylake('clk')
+SPR = IntelGoldenCove('spr')
+
 ARM = Arm('arm')
+GRAVITON = Arm('graviton')
+M1 = Arm('m1')
+
 AMD = Amd('amd')
+
 POWER8 = Power('power8')
 POWER9 = Power('power9')
 
 # Devices
 NVIDIAX = NvidiaDevice('nvidiaX')
 AMDGPUX = AmdDevice('amdgpuX')
+INTELGPUX = IntelDevice('intelgpuX')
 
 
 platform_registry = {
@@ -553,14 +771,19 @@ platform_registry = {
     'skx': SKX,  # Skylake
     'klx': KLX,  # Kaby Lake
     'clx': CLX,  # Coffee Lake
+    'clk': CLK,  # Cascade Lake
+    'spr': SPR,  # Sapphire Rapids
     'knl': KNL,
     'knl7210': KNL7210,
     'arm': ARM,  # Generic ARM CPU
+    'graviton': GRAVITON,  # AMS arm
+    'm1': M1,
     'amd': AMD,  # Generic AMD CPU
     'power8': POWER8,
     'power9': POWER9,
     'nvidiaX': NVIDIAX,  # Generic NVidia GPU
-    'amdgpuX': AMDGPUX   # Generic AMD GPU
+    'amdgpuX': AMDGPUX,   # Generic AMD GPU
+    'intelgpuX': INTELGPUX   # Generic Intel GPU
 }
 """
 Registry dict for deriving Platform classes according to the environment variable

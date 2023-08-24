@@ -42,18 +42,22 @@ class Constant(DataSymbol, ArgProvider):
 
     is_Input = True
     is_Constant = True
-    is_Scalar = True
+
+    __rkwargs__ = DataSymbol.__rkwargs__ + ('value',)
 
     def __init_finalize__(self, *args, **kwargs):
-        self._value = kwargs.get('value', 0)
+        self._value = kwargs.pop('value', 0)
+
+        kwargs.setdefault('is_const', True)
+        super().__init_finalize__(*args, **kwargs)
 
     @classmethod
     def __dtype_setup__(cls, **kwargs):
         return kwargs.get('dtype', np.float32)
 
     @property
-    def is_const(self):
-        return True
+    def value(self):
+        return self.data
 
     @property
     def data(self):
@@ -93,9 +97,9 @@ class Constant(DataSymbol, ArgProvider):
         else:
             return self._arg_defaults()
 
-    def _arg_check(self, args, intervals):
+    def _arg_check(self, args, intervals, **kwargs):
         """
-        Check that ``args`` contains legal runtime values bound to ``self``.
+        Check that `args` contains legal runtime values bound to `self`.
         """
         if self.name not in args:
             raise InvalidArgument("No runtime value for %s" % self.name)
@@ -107,5 +111,3 @@ class Constant(DataSymbol, ArgProvider):
                         "Constant data type %s" % (key.dtype, self.name, self.dtype))
         except AttributeError:
             pass
-
-    _pickle_kwargs = DataSymbol._pickle_kwargs + ['_value']

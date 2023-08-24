@@ -39,8 +39,8 @@ def run(shape=(50, 50, 50), spacing=(20.0, 20.0, 20.0), tn=1000.0,
     # Define receiver geometry (spread across x, just below surface)
     rec, u, summary = solver.forward(save=save, autotune=autotune)
 
-    if preset == 'constant':
-        # With  a new m as Constant
+    if preset == 'constant-isotropic':
+        # With a new m as Constant
         v0 = Constant(name="v", value=2.0, dtype=np.float32)
         solver.forward(save=save, vp=v0)
         # With a new vp as a scalar value
@@ -63,11 +63,10 @@ def run(shape=(50, 50, 50), spacing=(20.0, 20.0, 20.0), tn=1000.0,
     return summary.gflopss, summary.oi, summary.timings, [rec, u.data]
 
 
-@pytest.mark.parametrize('ndim', [1, 2, 3])
+@pytest.mark.parametrize('shape', [(101,), (51, 51), (16, 16, 16)])
 @pytest.mark.parametrize('k', ['OT2', 'OT4'])
-def test_isoacoustic_stability(ndim, k):
-    shape = tuple([11]*ndim)
-    spacing = tuple([20]*ndim)
+def test_isoacoustic_stability(shape, k):
+    spacing = tuple([20]*len(shape))
     _, _, _, [rec, _] = run(shape=shape, spacing=spacing, tn=20000.0, nbl=0, kernel=k)
     assert np.isfinite(norm(rec))
 

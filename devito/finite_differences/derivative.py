@@ -4,11 +4,9 @@ from collections.abc import Iterable
 from cached_property import cached_property
 import sympy
 
-from devito.finite_differences.finite_difference import (generic_derivative,
-                                                         first_derivative,
-                                                         cross_derivative)
-from devito.finite_differences.differentiable import Differentiable, EvalDerivative
-from devito.finite_differences.tools import direct, transpose
+from .finite_difference import generic_derivative, first_derivative, cross_derivative
+from .differentiable import Differentiable
+from .tools import direct, transpose
 from devito.tools import as_mapper, as_tuple, filter_ordered, frozendict
 from devito.types.utils import DimensionTuple
 
@@ -85,11 +83,13 @@ class Derivative(sympy.Derivative, Differentiable):
     evaluation are `x0`, `fd_order` and `side`.
     """
 
-    _state = ('expr', 'dims', 'side', 'fd_order', 'transpose', '_ppsubs', 'x0')
     _fd_priority = 3
 
+    __rargs__ = ('expr', 'dims')
+    __rkwargs__ = ('side', 'deriv_order', 'fd_order', 'transpose', '_ppsubs', 'x0')
+
     def __new__(cls, expr, *dims, **kwargs):
-        if type(expr) == sympy.Derivative:
+        if type(expr) is sympy.Derivative:
             raise ValueError("Cannot nest sympy.Derivative with devito.Derivative")
         if not isinstance(expr, Differentiable):
             raise ValueError("`expr` must be a Differentiable object")
@@ -106,7 +106,18 @@ class Derivative(sympy.Derivative, Differentiable):
         obj._deriv_order = orders if skip else DimensionTuple(*orders, getters=obj._dims)
         obj._side = kwargs.get("side")
         obj._transpose = kwargs.get("transpose", direct)
-        obj._ppsubs = as_tuple(frozendict(i) for i in kwargs.get("subs", []))
+
+        ppsubs = kwargs.get("subs", kwargs.get("_ppsubs", []))
+        processed = []
+        if ppsubs:
+            for i in ppsubs:
+                try:
+                    processed.append(frozendict(i))
+                except AttributeError:
+                    # E.g. `i` is a Transform object
+                    processed.append(i)
+        obj._ppsubs = tuple(processed)
+
         obj._x0 = frozendict(kwargs.get('x0', {}))
         return obj
 
@@ -186,10 +197,10 @@ class Derivative(sympy.Derivative, Differentiable):
         _x0 = dict(self._x0)
         _fd_order = dict(self.fd_order._getters)
         try:
-            _fd_order.update(**(fd_order or {}))
+            _fd_order.update(fd_order or {})
             _fd_order = tuple(_fd_order.values())
             _fd_order = DimensionTuple(*_fd_order, getters=self.dims)
-            _x0.update(x0)
+            _x0.update(x0 or {})
         except AttributeError:
             raise TypeError("Multi-dimensional Derivative, input expected as a dict")
 
@@ -203,32 +214,60 @@ class Derivative(sympy.Derivative, Differentiable):
         _kwargs.update(**kwargs)
         return Derivative(expr, *self.dims, **_kwargs)
 
-    @property
-    def func(self):
-        return lambda *a, **kw: self._new_from_self(expr=a[0], **kw)
+    def func(self, expr, *args, **kwargs):
+        return self._new_from_self(expr=expr, **kwargs)
 
-    def subs(self, *args, **kwargs):
-        """
-        Bypass sympy.Subs as Devito has its own lazy evaluation mechanism.
-        """
-        try:
-            rules = dict(*args)
-        except TypeError:
-            rules = dict((args,))
-        kwargs.pop('simultaneous', None)
-        return self.xreplace(rules, **kwargs)
+    def _subs(self, old, new, **hints):
+        # Basic case
+        if old == self:
+            return new
+        # Is it in expr?
+        if self.expr.has(old):
+            newexpr = self.expr._subs(old, new, **hints)
+            try:
+                return self._new_from_self(expr=newexpr)
+            except ValueError:
+                # Expr replacement leads to non-differentiable expression
+                # e.g `f.dx.subs(f: 1) = 1.dx = 0`
+                # returning zero
+                return sympy.S.Zero
+
+        # In case `x0` was passed as a substitution instead of `(x0=`
+        if str(old) == 'x0':
+            return self._new_from_self(x0={self.dims[0]: new})
+
+        # Trying to substitute by another derivative with different metadata
+        # Only need to check if is a Derivative since one for the cases above would
+        # have found it
+        if isinstance(old, Derivative):
+            return self
+
+        # Fall back if we didn't catch any special case
+        return self.xreplace({old: new}, **hints)
 
     def _xreplace(self, subs):
         """
         This is a helper method used internally by SymPy. We exploit it to postpone
         substitutions until evaluation.
         """
+        # Return if no subs
+        if not subs:
+            return self, False
+
+        # Check if trying to replace the whole expression
+        if self in subs:
+            new = subs.pop(self)
+            try:
+                return new._xreplace(subs)
+            except AttributeError:
+                return new, True
+
         subs = self._ppsubs + (subs,)  # Postponed substitutions
         return self._new_from_self(subs=subs), True
 
     @cached_property
     def _metadata(self):
-        state = list(self._state)
+        state = list(self.__rargs__ + self.__rkwargs__)
         state.remove('expr')
         ret = [getattr(self, i) for i in state]
         ret.append(self.expr.staggered or (None,))
@@ -311,56 +350,53 @@ class Derivative(sympy.Derivative, Differentiable):
             # the expression as is.
             return self._new_from_self(x0=x0)
 
-    @property
-    def evaluate(self):
+    def _evaluate(self, **kwargs):
         # Evaluate finite-difference.
-        # Note: evaluate and _eval_fd splitted for potential future different
-        # types of discretizations.
-        return self._eval_fd(self.expr)
+        # NOTE: `evaluate` and `_eval_fd` split for potential future different
+        # types of discretizations
+        return self._eval_fd(self.expr, **kwargs)
 
     @property
     def _eval_deriv(self):
         return self._eval_fd(self.expr)
 
-    def _eval_fd(self, expr):
+    def _eval_fd(self, expr, **kwargs):
         """
-        Evaluate finite difference approximation of the Derivative.
-        Evaluation is carried out via the following four steps:
+        Evaluate the finite-difference approximation of the Derivative.
+        Evaluation is carried out via the following three steps:
 
         - 1: Evaluate derivatives within the expression. For example given
             `f.dx * g`, `f.dx` will be evaluated first.
         - 2: Evaluate the finite difference for the (new) expression.
-        - 3: Evaluate remaining terms (as `g` may need to be evaluated
-        at a different point).
-        - 4: Apply substitutions.
-        - 5: Cast to an object of type `EvalDerivative` so that we know
-             the argument stems from a `Derivative. This may be useful for
-             later compilation passes.
+             This in turn is a two-step procedure, for Functions that may
+             may need to be evaluated at a different point due to e.g. a
+             shited derivative.
+        - 3: Apply substitutions.
         """
         # Step 1: Evaluate derivatives within expression
-        expr = getattr(expr, '_eval_deriv', expr)
+        try:
+            expr = expr._evaluate(**kwargs)
+        except AttributeError:
+            pass
+
+        # If True, the derivative will be fully expanded as a sum of products,
+        # otherwise an IndexSum will returned
+        expand = kwargs.get('expand', True)
 
         # Step 2: Evaluate FD of the new expression
         if self.side is not None and self.deriv_order == 1:
             res = first_derivative(expr, self.dims[0], self.fd_order,
                                    side=self.side, matvec=self.transpose,
-                                   x0=self.x0)
+                                   x0=self.x0, expand=expand)
         elif len(self.dims) > 1:
             res = cross_derivative(expr, self.dims, self.fd_order, self.deriv_order,
-                                   matvec=self.transpose, x0=self.x0)
+                                   matvec=self.transpose, x0=self.x0, expand=expand)
         else:
             res = generic_derivative(expr, *self.dims, self.fd_order, self.deriv_order,
-                                     matvec=self.transpose, x0=self.x0)
+                                     matvec=self.transpose, x0=self.x0, expand=expand)
 
-        # Step 3: Evaluate remaining part of expression
-        res = res.evaluate
-
-        # Step 4: Apply substitution
+        # Step 3: Apply substitutions
         for e in self._ppsubs:
             res = res.xreplace(e)
-
-        # Step 5: Cast to EvaluatedDerivative
-        assert res.is_Add
-        res = EvalDerivative(*res.args, evaluate=False)
 
         return res

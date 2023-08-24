@@ -1,24 +1,22 @@
-from collections import namedtuple
+from collections import OrderedDict
+from functools import singledispatch
 
 import cgen as c
 from sympy import Or
-import numpy as np
 
-from devito.data import FULL
-from devito.ir.equations import DummyEq
-from devito.ir.iet import (Call, Callable, Conditional, List, SyncSpot, While,
-                           FindNodes, LocalExpression, Transformer, BlankLine,
-                           PragmaList, DummyExpr, derive_parameters, make_thread_ctx)
-from devito.ir.support import Forward
+from devito.exceptions import CompilationError
+from devito.ir.iet import (Call, Callable, List, SyncSpot, FindNodes,
+                           Transformer, BlankLine, BusyWait, DummyExpr, AsyncCall,
+                           AsyncCallable, derive_parameters)
+from devito.ir.support import (WaitLock, WithLock, ReleaseLock, FetchUpdate,
+                               PrefetchUpdate)
 from devito.passes.iet.engine import iet_pass
 from devito.passes.iet.langbase import LangBB
-from devito.symbolics import CondEq, CondNe, FieldFromComposite, ListInitializer
-from devito.tools import (as_mapper, as_list, filter_ordered, filter_sorted,
-                          is_integer)
-from devito.types import (WaitLock, WithLock, FetchWait, FetchWaitPrefetch,
-                          Delete, SharedData)
+from devito.symbolics import CondEq, CondNe
+from devito.tools import as_mapper
+from devito.types import HostLayer
 
-__init__ = ['Orchestrator', 'BusyWait']
+__init__ = ['Orchestrator']
 
 
 class Orchestrator(object):
@@ -45,204 +43,192 @@ class Orchestrator(object):
 
         iet = List(body=(waitloop,) + iet.body)
 
-        return iet
+        return iet, []
 
-    def _make_withlock(self, iet, sync_ops, pieces, root):
-        # Sorting for deterministic code gen
-        locks = sorted({s.lock for s in sync_ops}, key=lambda i: i.name)
+    def _make_releaselock(self, iet, sync_ops, *args):
+        pre = []
+        pre.append(BusyWait(Or(*[CondNe(s.handle, 2) for s in sync_ops])))
+        pre.extend(DummyExpr(s.handle, 0) for s in sync_ops)
 
-        # The `min` is used to pick the maximum possible degree of parallelism.
-        # For example, assume there are two locks in the given `sync_ops`, `lock0(i)`
-        # and `lock1(j)`. If, say, `lock0` protects 3 entries of a certain Function
-        # `u`, while `lock1` protects 2 entries of the Function `v`, then there
-        # will never be more than 2 threads in flight concurrently
-        npthreads = min(i.size for i in locks)
+        iet = List(
+            header=c.Comment("Release lock(s) as soon as possible"),
+            body=pre + [iet]
+        )
 
-        preactions = []
-        postactions = []
-        for s in sync_ops:
-            imask = [s.handle.indices[d] if d.root in s.lock.locked_dimensions else FULL
-                     for d in s.target.dimensions]
+        return iet, []
 
-            update = List(header=self.lang._map_update_wait_host(s.target, imask,
-                                                                 SharedData._field_id))
-            preactions.append(List(body=[BlankLine, update, DummyExpr(s.handle, 1)]))
-            postactions.append(DummyExpr(s.handle, 2))
-        preactions.append(BlankLine)
-        postactions.insert(0, BlankLine)
+    def _make_withlock(self, iet, sync_ops, layer):
+        body, prefix = withlock(layer, iet, sync_ops, self.lang, self.sregistry)
 
-        # Turn `iet` into a ThreadFunction so that it can be executed
-        # asynchronously by a pthread in the `npthreads` pool
-        name = self.sregistry.make_name(prefix='copy_device_to_host')
-        body = List(body=tuple(preactions) + iet.body + tuple(postactions))
-        tctx = make_thread_ctx(name, body, root, npthreads, sync_ops, self.sregistry)
-        pieces.funcs.extend(tctx.funcs)
+        # Turn `iet` into an AsyncCallable so that subsequent passes know
+        # that we're happy for this Callable to be executed asynchronously
+        name = self.sregistry.make_name(prefix=prefix)
+        body = List(body=body)
+        parameters = derive_parameters(body)
+        efunc = AsyncCallable(name, body, parameters=parameters)
 
-        # Schedule computation to the first available thread
-        iet = tctx.activate
+        # The corresponding AsyncCall
+        iet = AsyncCall(name, efunc.parameters)
 
-        # Initialize the locks
-        for i in locks:
-            values = np.full(i.shape, 2, dtype=np.int32).tolist()
-            pieces.init.append(LocalExpression(DummyEq(i, ListInitializer(values))))
+        return iet, [efunc]
 
-        # Fire up the threads
-        pieces.init.append(tctx.init)
-        pieces.threads.append(tctx.threads)
-
-        # Final wait before jumping back to Python land
-        pieces.finalize.append(tctx.finalize)
-
-        return iet
-
-    def _make_fetchwait(self, iet, sync_ops, *args):
-        # Construct fetches
-        fetches = []
-        for s in sync_ops:
-            fc = s.fetch.subs(s.dim, s.dim.symbolic_min)
-            imask = [(fc, s.size) if d.root is s.dim.root else FULL for d in s.dimensions]
-            fetches.append(self.lang._map_to(s.function, imask))
-
-        # Glue together the new IET pieces
-        iet = List(header=fetches, body=iet)
-
-        return iet
-
-    def _make_fetchwaitprefetch(self, iet, sync_ops, pieces, root):
-        fetches = []
-        prefetches = []
-        presents = []
-        for s in sync_ops:
-            if s.direction is Forward:
-                fc = s.fetch.subs(s.dim, s.dim.symbolic_min)
-                pfc = s.fetch + 1
-                fc_cond = s.next_cbk(s.dim.symbolic_min)
-                pfc_cond = s.next_cbk(s.dim + 1)
-            else:
-                fc = s.fetch.subs(s.dim, s.dim.symbolic_max)
-                pfc = s.fetch - 1
-                fc_cond = s.next_cbk(s.dim.symbolic_max)
-                pfc_cond = s.next_cbk(s.dim - 1)
-
-            # Construct init IET
-            imask = [(fc, s.size) if d.root is s.dim.root else FULL for d in s.dimensions]
-            fetch = PragmaList(self.lang._map_to(s.function, imask),
-                               {s.function} | fc.free_symbols)
-            fetches.append(Conditional(fc_cond, fetch))
-
-            # Construct present clauses
-            imask = [(s.fetch, s.size) if d.root is s.dim.root else FULL
-                     for d in s.dimensions]
-            presents.extend(as_list(self.lang._map_present(s.function, imask)))
-
-            # Construct prefetch IET
-            imask = [(pfc, s.size) if d.root is s.dim.root else FULL
-                     for d in s.dimensions]
-            prefetch = PragmaList(self.lang._map_to_wait(s.function, imask,
-                                                         SharedData._field_id),
-                                  {s.function} | pfc.free_symbols)
-            prefetches.append(Conditional(pfc_cond, prefetch))
+    def _make_fetchupdate(self, iet, sync_ops, layer):
+        body, prefix = fetchupdate(layer, iet, sync_ops, self.lang, self.sregistry)
 
         # Turn init IET into a Callable
-        functions = filter_ordered(s.function for s in sync_ops)
-        name = self.sregistry.make_name(prefix='init_device')
-        body = List(body=fetches)
-        parameters = filter_sorted(functions + derive_parameters(body))
-        func = Callable(name, body, 'void', parameters, 'static')
-        pieces.funcs.append(func)
+        name = self.sregistry.make_name(prefix=prefix)
+        body = List(body=body)
+        parameters = derive_parameters(body)
+        efunc = Callable(name, body, 'void', parameters, 'static')
 
         # Perform initial fetch by the main thread
-        pieces.init.append(List(
+        iet = List(
             header=c.Comment("Initialize data stream"),
-            body=[Call(name, parameters), BlankLine]
-        ))
+            body=Call(name, parameters)
+        )
 
-        # Turn prefetch IET into a ThreadFunction
-        name = self.sregistry.make_name(prefix='prefetch_host_to_device')
-        body = List(header=c.Line(), body=prefetches)
-        tctx = make_thread_ctx(name, body, root, None, sync_ops, self.sregistry)
-        pieces.funcs.extend(tctx.funcs)
+        return iet, [efunc]
 
-        # Glue together all the IET pieces, including the activation logic
-        sdata = tctx.sdata
-        threads = tctx.threads
-        iet = List(body=[
-            BlankLine,
-            BusyWait(CondNe(FieldFromComposite(sdata._field_flag,
-                                               sdata[threads.index]), 1)),
-            List(header=presents),
-            iet,
-            tctx.activate
-        ])
+    def _make_prefetchupdate(self, iet, sync_ops, layer):
+        body, prefix = prefetchupdate(layer, iet, sync_ops, self.lang, self.sregistry)
 
-        # Fire up the threads
-        pieces.init.append(tctx.init)
-        pieces.threads.append(threads)
+        # Turn `iet` into an AsyncCallable so that subsequent passes know
+        # that we're happy for this Callable to be executed asynchronously
+        name = self.sregistry.make_name(prefix=prefix)
+        body = List(body=body)
+        parameters = derive_parameters(body)
+        efunc = AsyncCallable(name, body, parameters=parameters)
 
-        # Final wait before jumping back to Python land
-        pieces.finalize.append(tctx.finalize)
+        # The corresponding AsyncCall
+        iet = AsyncCall(name, efunc.parameters)
 
-        return iet
-
-    def _make_delete(self, iet, sync_ops, *args):
-        # Construct deletion clauses
-        deletions = []
-        for s in sync_ops:
-            if s.dim.is_Custom:
-                fc = s.fetch.subs(s.dim, s.dim.symbolic_min)
-                imask = [(fc, s.size) if d.root is s.dim.root else FULL
-                         for d in s.dimensions]
-            else:
-                imask = [(s.fetch, s.size) if d.root is s.dim.root else FULL
-                         for d in s.dimensions]
-            deletions.append(self.lang._map_delete(s.function, imask))
-
-        # Glue together the new IET pieces
-        iet = List(header=c.Line(), body=iet, footer=[c.Line()] + deletions)
-
-        return iet
+        return iet, [efunc]
 
     @iet_pass
     def process(self, iet):
-
-        def key(s):
-            # The SyncOps are to be processed in the following order
-            return [WaitLock, WithLock, Delete, FetchWait, FetchWaitPrefetch].index(s)
-
-        callbacks = {
-            WaitLock: self._make_waitlock,
-            WithLock: self._make_withlock,
-            FetchWait: self._make_fetchwait,
-            FetchWaitPrefetch: self._make_fetchwaitprefetch,
-            Delete: self._make_delete
-        }
-
         sync_spots = FindNodes(SyncSpot).visit(iet)
-
         if not sync_spots:
             return iet, {}
 
-        pieces = namedtuple('Pieces', 'init finalize funcs threads')([], [], [], [])
+        callbacks = OrderedDict([
+            (WaitLock, self._make_waitlock),
+            (WithLock, self._make_withlock),
+            (FetchUpdate, self._make_fetchupdate),
+            (PrefetchUpdate, self._make_prefetchupdate),
+            (ReleaseLock, self._make_releaselock),
+        ])
 
+        # The SyncOps are to be processed in a given order
+        key = lambda s: list(callbacks).index(s)
+
+        efuncs = []
         subs = {}
         for n in sync_spots:
             mapper = as_mapper(n.sync_ops, lambda i: type(i))
-            for _type in sorted(mapper, key=key):
-                subs[n] = callbacks[_type](subs.get(n, n), mapper[_type], pieces, iet)
+
+            for t in sorted(mapper, key=key):
+                sync_ops = mapper[t]
+
+                layers = {infer_layer(s.function) for s in sync_ops}
+                if len(layers) != 1:
+                    raise CompilationError("Unsupported streaming case")
+                layer = layers.pop()
+
+                subs[n], v = callbacks[t](subs.get(n, n), sync_ops, layer)
+                efuncs.extend(v)
 
         iet = Transformer(subs).visit(iet)
 
-        # Add initialization and finalization code
-        init = List(body=pieces.init, footer=c.Line())
-        finalize = List(header=c.Line(), body=pieces.finalize)
-        iet = iet._rebuild(body=(init,) + iet.body + (finalize,))
-
-        return iet, {'efuncs': pieces.funcs,
-                     'includes': ['pthread.h'],
-                     'args': [i.size for i in pieces.threads if not is_integer(i.size)]}
+        return iet, {'efuncs': efuncs}
 
 
-# Utils
+# Task handlers
 
-class BusyWait(While):
-    pass
+layer_host = HostLayer('host')
+
+
+@singledispatch
+def infer_layer(f):
+    """
+    The layer of the node storage hierarchy in which a Function is found.
+    """
+    return layer_host
+
+
+@singledispatch
+def withlock(layer, iet, sync_ops, lang, sregistry):
+    raise NotImplementedError
+
+
+@withlock.register(HostLayer)
+def _(layer, iet, sync_ops, lang, sregistry):
+    name = sregistry.make_name(prefix='qid')
+    qid = lang.AsyncQueue(name=name)
+
+    try:
+        body = [lang._map_update_host_async(s.target, s.imask, qid)
+                for s in sync_ops]
+        if lang._map_wait is not None:
+            body.append(lang._map_wait(qid))
+
+        body.extend([DummyExpr(s.handle, 1) for s in sync_ops])
+        body.append(BlankLine)
+
+        name = 'copy_to_%s' % layer.suffix
+    except NotImplementedError:
+        # A non-device backend
+        body = []
+        name = 'copy_from_%s' % layer.suffix
+
+    body.extend(list(iet.body))
+
+    body.append(BlankLine)
+    body.extend([DummyExpr(s.handle, 2) for s in sync_ops])
+
+    return body, name
+
+
+@singledispatch
+def fetchupdate(layer, iet, sync_ops, lang, sregistry):
+    raise NotImplementedError
+
+
+@fetchupdate.register(HostLayer)
+def _(layer, iet, sync_ops, lang, sregistry):
+    body = list(iet.body)
+    try:
+        body.extend([lang._map_update_device(s.target, s.imask) for s in sync_ops])
+        name = 'init_from_%s' % layer.suffix
+    except NotImplementedError:
+        name = 'init_to_%s' % layer.suffix
+
+    return body, name
+
+
+@singledispatch
+def prefetchupdate(layer, iet, sync_ops, lang, sregistry):
+    raise NotImplementedError
+
+
+@prefetchupdate.register(HostLayer)
+def _(layer, iet, sync_ops, lang, sregistry):
+    name = sregistry.make_name(prefix='qid')
+    qid = lang.AsyncQueue(name=name)
+
+    try:
+        body = [lang._map_update_device_async(s.target, s.imask, qid)
+                for s in sync_ops]
+        if lang._map_wait is not None:
+            body.append(lang._map_wait(qid))
+        body.append(BlankLine)
+
+        name = 'prefetch_from_%s' % layer.suffix
+    except NotImplementedError:
+        body = []
+        name = 'prefetch_to_%s' % layer.suffix
+
+    body.extend([DummyExpr(s.handle, 2) for s in sync_ops])
+
+    body = iet.body + (BlankLine,) + tuple(body)
+
+    return body, name

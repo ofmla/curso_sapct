@@ -1,111 +1,191 @@
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 
-from devito.ir.support.space import Interval
-from devito.ir.support.stencil import Stencil
-from devito.symbolics import FunctionFromPointer, retrieve_indexed, retrieve_terminals
-from devito.tools import as_tuple, flatten, filter_sorted
-from devito.types import Dimension
+from devito.symbolics import CallFromPointer, retrieve_indexed, retrieve_terminals
+from devito.tools import DefaultOrderedDict, as_tuple, flatten, filter_sorted, split
+from devito.types import (Dimension, DimensionTuple, Indirection, ModuloDimension,
+                          StencilDimension)
 
-__all__ = ['detect_accesses', 'detect_oobs', 'build_iterators', 'build_intervals',
-           'detect_io']
+__all__ = ['AccessMode', 'Stencil', 'IMask', 'detect_accesses', 'detect_io',
+           'pull_dims', 'sdims_min', 'sdims_max']
+
+
+class AccessMode(object):
+
+    """
+    A descriptor for access modes (read, write, ...).
+    """
+
+    _modes = ('R', 'W', 'R/W', 'RR', 'WR', 'NA')
+
+    def __init__(self, is_read=False, is_write=False, mode=None):
+        if mode is None:
+            assert isinstance(is_read, bool) and isinstance(is_write, bool)
+            if is_read and is_write:
+                mode = 'R/W'
+            elif is_read:
+                mode = 'R'
+            elif is_write:
+                mode = 'W'
+            else:
+                mode = 'NA'
+
+        assert mode in self._modes
+        self.mode = mode
+
+    def __repr__(self):
+        return self.mode
+
+    def __eq__(self, other):
+        return isinstance(other, AccessMode) and self.mode == other.mode
+
+    @property
+    def is_read(self):
+        return self.mode in ('R', 'R/W', 'RR')
+
+    @property
+    def is_write(self):
+        return self.mode in ('W', 'R/W', 'WR')
+
+    @property
+    def is_read_only(self):
+        return self.is_read and not self.is_write
+
+    @property
+    def is_write_only(self):
+        return self.is_write and not self.is_read
+
+    @property
+    def is_read_write(self):
+        return self.is_read and self.is_write
+
+    @property
+    def is_read_reduction(self):
+        return self.mode == 'RR'
+
+    @property
+    def is_write_reduction(self):
+        return self.mode == 'WR'
+
+    @property
+    def is_reduction(self):
+        return self.is_read_reduction or self.is_write_reduction
+
+
+class Stencil(DefaultOrderedDict):
+
+    """
+    A mapping between Dimensions and symbolic expressions representing the
+    points of the stencil.
+
+    Typically the values are just integers.
+
+    Parameters
+    ----------
+    entries : iterable of 2-tuples, optional
+        The Stencil entries.
+    """
+
+    def __init__(self, items=None):
+        # Normalize input
+        items = [(d, set(as_tuple(v))) for d, v in as_tuple(items)]
+
+        super().__init__(set, items)
+
+    @classmethod
+    def union(cls, *dicts):
+        """
+        Compute the union of a collection of Stencils.
+        """
+        output = Stencil()
+        for i in dicts:
+            for k, v in i.items():
+                output[k] |= v
+        return output
+
+
+class IMask(DimensionTuple):
+
+    """
+    A mapper from Dimensions to data points or ranges.
+    """
+
+    pass
 
 
 def detect_accesses(exprs):
     """
-    Return a mapper ``M : F -> S``, where F are Functions appearing
-    in ``exprs`` and S are Stencils. ``M[f]`` represents all data accesses
-    to ``f`` within ``exprs``. Also map ``M[None]`` to all Dimensions used in
-    ``exprs`` as plain symbols, rather than as array indices.
+    Return a mapper `M : F -> S`, where F are Functions appearing in `exprs`
+    and S are Stencils. `M[f]` represents all data accesses to `f` within
+    `exprs`. Also map `M[None]` to all Dimensions used in `exprs` as plain
+    symbols, rather than as array indices.
     """
     # Compute M : F -> S
     mapper = defaultdict(Stencil)
     for e in retrieve_indexed(exprs, deep=True):
         f = e.function
-        for a in e.indices:
-            if isinstance(a, Dimension):
+
+        for a, d0 in zip(e.indices, f.dimensions):
+            if isinstance(a, Indirection):
+                a = a.mapped
+
+            if isinstance(a, ModuloDimension) and a.parent.is_Stepping:
+                # Explicitly unfold SteppingDimensions-induced ModuloDimensions
+                mapper[f][a.root].update([a.offset - a.root])
+
+            elif isinstance(a, Dimension):
                 mapper[f][a].update([0])
-            d = None
-            off = []
-            for i in a.args:
-                if isinstance(i, Dimension):
-                    d = i
-                elif i.is_integer:
-                    off += [int(i)]
-            if d is not None:
-                mapper[f][d].update(off or [0])
+
+            elif a.is_Add:
+                dims = {i for i in a.free_symbols if isinstance(i, Dimension)}
+
+                if not dims:
+                    continue
+                elif len(dims) > 1:
+                    # There are two reasons we may end up here, 1) indirect
+                    # accesses (e.g., a[b[x, y] + 1, y]) or 2) as a result of
+                    # skewing-based optimizations, such as time skewing (e.g.,
+                    # `x - time + 1`) or CIRE rotation (e.g., `x + xx - 4`)
+                    d, others = split(dims, lambda i: d0 in i._defines)
+
+                    if any(i.is_Indexed for i in a.args) or len(d) != 1:
+                        # Case 1) -- with indirect accesses there's not much we can infer
+                        continue
+                    else:
+                        # Case 2)
+                        d, = d
+                        _, o = split(others, lambda i: i.is_Custom)
+                        off = sum(i for i in a.args if i.is_integer or i.free_symbols & o)
+                else:
+                    d, = dims
+
+                    # At this point, typically, the offset will be an integer.
+                    # In some cases though it could be an expression, e.g.
+                    # `db0 + time_m - 1` (from CustomDimensions due to buffering)
+                    # or `x + o_x` (from MPI routines) or `time - ns` (from
+                    # guarded accesses to TimeFunctions) or ... In all these cases,
+                    # what really matters is the integer part of the offset, as
+                    # any other symbols may resolve to zero at runtime, which is
+                    # the base case scenario we fallback to
+                    off = sum(i for i in a.args if i.is_integer)
+
+                    # NOTE: `d in a.args` is too restrictive because of guarded
+                    # accesses such as `time / factor - 1`
+                    assert d in a.free_symbols
+
+                if (d.is_Custom or d.is_Default) and d.symbolic_size.is_integer:
+                    # Explicitly unfold Default and CustomDimensions
+                    mapper[f][d].update(range(off, d.symbolic_size + off))
+                else:
+                    mapper[f][d].add(off)
 
     # Compute M[None]
-    other_dims = [i for i in retrieve_terminals(exprs) if isinstance(i, Dimension)]
-    other_dims.extend(list(flatten(expr.implicit_dims for expr in as_tuple(exprs))))
+    other_dims = set()
+    for e in as_tuple(exprs):
+        other_dims.update(i for i in e.free_symbols if isinstance(i, Dimension))
+        other_dims.update(e.implicit_dims)
     mapper[None] = Stencil([(i, 0) for i in other_dims])
 
     return mapper
-
-
-def detect_oobs(mapper):
-    """
-    Given M as produced by :func:`detect_accesses`, return the set of
-    Dimensions that *cannot* be iterated over the entire computational
-    domain, to avoid out-of-bounds (OOB) accesses.
-    """
-    found = set()
-    for f, stencil in mapper.items():
-        if f is None or not (f.is_DiscreteFunction or f.is_Array):
-            continue
-        for d, v in stencil.items():
-            p = d.parent if d.is_Sub else d
-            try:
-                test0 = min(v) < 0
-                test1 = max(v) > f._size_nodomain[p].left + f._size_halo[p].right
-                if test0 or test1:
-                    # It'd mean trying to access a point before the
-                    # left padding (test0) or after the right halo (test1)
-                    found.add(p)
-            except KeyError:
-                # Unable to detect presence of OOB accesses
-                # (/p/ not in /f._size_halo/, typical of indirect
-                # accesses such as A[B[i]])
-                pass
-    return found | set().union(*[i._defines for i in found if i.is_Derived])
-
-
-def build_iterators(mapper):
-    """
-    Given M as produced by :func:`detect_accesses`, return a mapper ``M' : D -> V``,
-    where D is the set of Dimensions in M, and V is a set of DerivedDimensions.
-    M'[d] provides the sub-iterators along the Dimension `d`.
-    """
-    iterators = OrderedDict()
-    for k, v in mapper.items():
-        for d in v:
-            if d.is_Stepping:
-                values = iterators.setdefault(d.root, [])
-                if d not in values:
-                    values.append(d)
-            elif d.is_Conditional:
-                # There are no iterators associated to a ConditionalDimension
-                continue
-            else:
-                iterators.setdefault(d, [])
-    return {k: tuple(v) for k, v in iterators.items()}
-
-
-def build_intervals(stencil):
-    """
-    Given a Stencil, return an iterable of Intervals, one
-    for each Dimension in the stencil.
-    """
-    mapper = defaultdict(set)
-    for d, offs in stencil.items():
-        if d.is_Stepping:
-            mapper[d.root].update(offs)
-        elif d.is_Conditional:
-            mapper[d.parent].update(offs)
-        elif d.is_Modulo:
-            mapper[d.root].update({d.offset - d.root + i for i in offs})
-        else:
-            mapper[d].update(offs)
-    return [Interval(d, min(offs), max(offs)) for d, offs in mapper.items()]
 
 
 def detect_io(exprs, relax=False):
@@ -117,14 +197,14 @@ def detect_io(exprs, relax=False):
     exprs : expr-like or list of expr-like
         The searched expressions.
     relax : bool, optional
-        If False, as by default, collect only Constants and Functions.
-        Otherwise, collect any Basic object.
+        If False, as by default, collect all Input objects, such as
+        Constants and Functions. Otherwise, also collect AbstractFunctions.
     """
     exprs = as_tuple(exprs)
     if relax is False:
         rule = lambda i: i.is_Input
     else:
-        rule = lambda i: i.is_Scalar or i.is_Tensor
+        rule = lambda i: i.is_Input or i.is_AbstractFunction
 
     # Don't forget the nasty case with indirections on the LHS:
     # >>> u[t, a[x]] = f[x]  -> (reads={a, f}, writes={u})
@@ -136,7 +216,7 @@ def detect_io(exprs, relax=False):
             roots.extend(list(i.lhs.indices))
             roots.extend(list(i.conditionals.values()))
         except AttributeError:
-            # E.g., FunctionFromPointer
+            # E.g., CallFromPointer
             roots.append(i)
 
     reads = []
@@ -166,9 +246,50 @@ def detect_io(exprs, relax=False):
         except AttributeError:
             # We only end up here after complex IET transformations which make
             # use of composite types
-            assert isinstance(i.lhs, FunctionFromPointer)
+            assert isinstance(i.lhs, CallFromPointer)
             f = i.lhs.base.function
             if rule(f):
                 writes.append(f)
 
     return filter_sorted(reads), filter_sorted(writes)
+
+
+def pull_dims(exprs, flag=True):
+    """
+    Extract all Dimensions from one or more expressions. If `flag=True`
+    (default), all of the ancestor and descendant Dimensions are extracted
+    as well.
+    """
+    dims = set()
+    for e in as_tuple(exprs):
+        dims.update({i for i in e.free_symbols if i.is_Dimension})
+    if flag:
+        return set().union(*[d._defines for d in dims])
+    else:
+        return dims
+
+
+# *** Utility functions for expressions that potentially contain StencilDimensions
+
+def sdims_min(expr):
+    """
+    Replace all StencilDimensions in `expr` with their minimum point.
+    """
+    try:
+        sdims = expr.find(StencilDimension)
+    except AttributeError:
+        return expr
+    mapper = {e: e._min for e in sdims}
+    return expr.subs(mapper)
+
+
+def sdims_max(expr):
+    """
+    Replace all StencilDimensions in `expr` with their maximum point.
+    """
+    try:
+        sdims = expr.find(StencilDimension)
+    except AttributeError:
+        return expr
+    mapper = {e: e._max for e in sdims}
+    return expr.subs(mapper)

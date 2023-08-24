@@ -1,7 +1,9 @@
+from abc import ABC, abstractmethod
 from ctypes import c_int, c_void_p, sizeof
 from itertools import groupby, product
-from math import ceil
-from abc import ABC, abstractmethod
+from math import ceil, pow
+from sympy import factorint
+
 import atexit
 
 from cached_property import cached_property
@@ -10,7 +12,7 @@ from cgen import Struct, Value
 
 from devito.data import LEFT, CENTER, RIGHT, Decomposition
 from devito.parameters import configuration
-from devito.tools import EnrichedTuple, as_tuple, ctypes_to_cstr, is_integer
+from devito.tools import EnrichedTuple, as_tuple, ctypes_to_cstr, filter_ordered
 from devito.types import CompositeObject, Object
 
 
@@ -113,7 +115,7 @@ class AbstractDistributor(ABC):
         The global indices owned by the calling MPI rank, as a mapper from
         Dimensions to slices.
         """
-        return {d: slice(min(i), max(i) + 1)
+        return {d: slice(min(i), max(i) + 1) if len(i) > 0 else slice(0, -1)
                 for d, i in zip(self.dimensions, self.glb_numb)}
 
     @property
@@ -190,13 +192,9 @@ class Distributor(AbstractDistributor):
                 global init_by_devito
                 init_by_devito = True
 
+            # Note: the cloned communicator doesn't need to be explicitly freed;
+            # mpi4py takes care of that when the object gets out of scope
             self._input_comm = (input_comm or MPI.COMM_WORLD).Clone()
-
-            # Make sure the cloned communicator will be freed up upon exit
-            def cleanup():
-                if self._input_comm is not None:
-                    self._input_comm.Free()
-            atexit.register(cleanup)
 
             if topology is None:
                 # `MPI.Compute_dims` sets the dimension sizes to be as close to each other
@@ -208,6 +206,9 @@ class Distributor(AbstractDistributor):
                 # guarantee that 9 ranks are arranged into a 3x3 grid when shape=(9, 9))
                 self._topology = compute_dims(self._input_comm.size, len(shape))
             else:
+                # A custom topology may contain integers or the wildcard '*'
+                topology = CustomTopology(topology, self._input_comm)
+
                 self._topology = topology
 
             if self._input_comm is not input_comm:
@@ -257,9 +258,18 @@ class Distributor(AbstractDistributor):
     def topology(self):
         return self._topology
 
+    @property
+    def topology_logical(self):
+        if isinstance(self.topology, CustomTopology):
+            return self.topology.logical
+        else:
+            return None
+
     @cached_property
     def is_boundary_rank(self):
-        """ MPI rank interfaces with the boundary of the domain. """
+        """
+        MPI rank interfaces with the boundary of the domain.
+        """
         return any([True if i == 0 or i == j-1 else False for i, j in
                    zip(self.mycoords, self.topology)])
 
@@ -312,29 +322,32 @@ class Distributor(AbstractDistributor):
 
         Parameters
         ----------
-        index : int or list of ints
-            The index, or list of indices, for which the owning MPI rank(s) is
+        index : array of ints
+            The index, or array of indices, for which the owning MPI rank(s) is
             retrieved.
         """
-        assert isinstance(index, (tuple, list))
-        if len(index) == 0:
+        assert isinstance(index, np.ndarray)
+        if index.shape[0] == 0:
             return None
-        elif is_integer(index[0]):
-            # `index` is a single point
-            indices = [index]
-        else:
-            indices = index
-        ret = []
-        for i in indices:
-            assert len(i) == self.ndim
-            found = False
-            for r, j in enumerate(self.all_ranges):
-                if all(v in j[d] for v, d in zip(i, self.dimensions)):
-                    ret.append(r)
-                    found = True
-                    break
-            assert found
-        return as_tuple(ret)
+        elif sum(index.shape) == 1:
+            return index
+
+        assert index.shape[1] == self.ndim
+
+        # Add singleton dimension at the end if only single gridpoint is passed
+        # instead of support.
+        if len(index.shape) == 2:
+            index = np.expand_dims(index, axis=2)
+
+        ret = {}
+        for r, j in enumerate(self.all_ranges):
+            mins = np.array([b[0] for b in j]).reshape(1, -1, 1)
+            maxs = np.array([b[-1] for b in j]).reshape(1, -1, 1)
+            inds = np.where(((index <= maxs) & (index >= mins)).all(axis=1))
+            if inds[0].size == 0:
+                continue
+            ret[r] = filter_ordered(inds[0])
+        return ret
 
     @property
     def neighborhood(self):
@@ -368,11 +381,11 @@ class Distributor(AbstractDistributor):
         # Set up diagonal neighbours
         for i in product([LEFT, CENTER, RIGHT], repeat=self.ndim):
             neighbor = [c + s.val for c, s in zip(self.mycoords, i)]
-            try:
-                ret[i] = self.comm.Get_cart_rank(neighbor)
-            except:
-                # Fallback for MPI ranks at the grid boundary
+
+            if any(c < 0 or c >= s for c, s in zip(neighbor, self.topology)):
                 ret[i] = MPI.PROC_NULL
+            else:
+                ret[i] = self.comm.Get_cart_rank(neighbor)
 
         return ret
 
@@ -472,6 +485,8 @@ class MPICommObject(Object):
 
     name = 'comm'
 
+    __rargs__ = ()
+
     # See https://github.com/mpi4py/mpi4py/blob/master/demo/wrap-ctypes/helloworld.py
     if MPI._sizeof(MPI.Comm) == sizeof(c_int):
         dtype = type('MPI_Comm', (c_int,), {})
@@ -495,11 +510,10 @@ class MPICommObject(Object):
         else:
             return self._arg_defaults()
 
-    # Pickling support
-    _pickle_args = []
-
 
 class MPINeighborhood(CompositeObject):
+
+    __rargs__ = ('neighborhood',)
 
     def __init__(self, neighborhood):
         self._neighborhood = neighborhood
@@ -549,8 +563,98 @@ class MPINeighborhood(CompositeObject):
         else:
             return self._arg_defaults()
 
-    # Pickling support
-    _pickle_args = ['neighborhood']
+
+class CustomTopology(tuple):
+
+    """
+    The CustomTopology class provides a mechanism to describe parametric domain
+    decompositions. It allows users to specify how the dimensions of a domain are
+    decomposed into chunks based on certain parameters.
+
+    Examples
+    --------
+    For example, let's consider a domain with three distributed dimensions: x, y, and z,
+    and an MPI communicator with N processes. Here are a few examples of CustomTopology:
+
+    With N known, say N=4:
+    * `(1, 1, 4)`: the z Dimension is decomposed into 4 chunks
+    * `(2, 1, 2)`: the x Dimension is decomposed into 2 chunks and the z Dimension
+                   is decomposed into 2 chunks
+
+    With N unknown:
+    * `(1, '*', 1)`: the wildcard `'*'` indicates that the runtime should decompose the y
+                     Dimension into N chunks
+    * `('*', '*', 1)`: the wildcard `'*'` indicates that the runtime should decompose both
+                       the x and y Dimensions in `nstars` factors of N, prioritizing
+                       the outermost dimension
+
+    Assuming that the number of ranks `N` cannot evenly be decomposed to the requested
+    stars=6 we decompose as evenly as possible by prioritising the outermost dimension
+
+    For N=3
+    * `('*', '*', 1)` gives: (3, 1, 1)
+    * `('*', 1, '*')` gives: (3, 1, 1)
+    * `(1, '*', '*')` gives: (1, 3, 1)
+
+    For N=6
+    * `('*', '*', 1)` gives: (3, 2, 1)
+    * `('*', 1, '*')` gives: (3, 1, 2)
+    * `(1, '*', '*')` gives: (1, 3, 2)
+
+    For N=8
+    * `('*', '*', '*')` gives: (2, 2, 2)
+    * `('*', '*', 1)` gives: (4, 2, 1)
+    * `('*', 1, '*')` gives: (4, 1, 2)
+    * `(1, '*', '*')` gives: (1, 4, 2)
+
+    Notes
+    -----
+    Users should not directly use the CustomTopology class. It is instantiated
+    by the Devito runtime based on user input.
+    """
+
+    def __new__(cls, items, input_comm):
+        # Keep track of nstars and already defined decompositions
+        nstars = items.count('*')
+
+        # If no stars exist we are ready
+        if nstars == 0:
+            processed = items
+        else:
+            # Init decomposition list and track star positions
+            processed = [1] * len(items)
+            star_pos = []
+            for i, item in enumerate(items):
+                if isinstance(item, int):
+                    processed[i] = item
+                else:
+                    star_pos.append(i)
+
+            # Compute the remaining procs to be allocated
+            alloc_procs = np.prod([i for i in items if i != '*'])
+            rem_procs = int(input_comm.size // alloc_procs)
+
+            # List of all factors of rem_procs in decreasing order
+            factors = factorint(rem_procs)
+            vals = [k for (k, v) in factors.items() for _ in range(v)][::-1]
+
+            # Split in number of stars
+            split = np.array_split(vals, nstars)
+
+            # Reduce
+            star_vals = [int(np.prod(s)) for s in split]
+
+            # Apply computed star values to the processed
+            for index, value in zip(star_pos, star_vals):
+                processed[index] = value
+
+        # Final check that topology matches the communicator size
+        assert np.prod(processed) == input_comm.size
+
+        obj = super().__new__(cls, processed)
+        obj.logical = items
+
+        return obj
 
 
 def compute_dims(nprocs, ndim):

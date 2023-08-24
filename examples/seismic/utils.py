@@ -1,5 +1,5 @@
 import numpy as np
-from argparse import ArgumentParser, Action
+from argparse import Action, ArgumentError, ArgumentParser
 
 from devito import error, configuration, warning
 from devito.tools import Pickable
@@ -50,12 +50,15 @@ def setup_rec_coords(model):
 class AcquisitionGeometry(Pickable):
     """
     Encapsulate the geometry of an acquisition:
-    - receiver positions and number
     - source positions and number
+    - receiver positions and number
 
     In practice this would only point to a segy file with the
     necessary information
     """
+
+    __rargs__ = ('grid', 'rec_positions', 'src_positions', 't0', 'tn')
+    __rkwargs__ = ('f0', 'src_type')
 
     def __init__(self, model, rec_positions, src_positions, t0, tn, **kwargs):
         """
@@ -74,7 +77,7 @@ class AcquisitionGeometry(Pickable):
         self._a = kwargs.get('a', None)
         self._t0w = kwargs.get('t0w', None)
         if self._src_type is not None and self._f0 is None:
-            error("Peak frequency must be provided in KH" +
+            error("Peak frequency must be provided in KHz" +
                   " for source of type %s" % self._src_type)
 
         self._grid = model.grid
@@ -166,7 +169,7 @@ class AcquisitionGeometry(Pickable):
 
     def new_src(self, name='src', src_type='self'):
         if self.src_type is None or src_type is None:
-            warning("No surce type defined, returning uninistiallized (zero) source")
+            warning("No source type defined, returning uninitiallized (zero) source")
             return PointSource(name=name, grid=self.grid,
                                time_range=self.time_axis, npoint=self.nsrc,
                                coordinates=self.src_positions)
@@ -175,9 +178,6 @@ class AcquisitionGeometry(Pickable):
                                           time_range=self.time_axis, npoint=self.nsrc,
                                           coordinates=self.src_positions,
                                           t0=self._t0w, a=self._a)
-
-    _pickle_args = ['grid', 'rec_positions', 'src_positions', 't0', 'tn']
-    _pickle_kwargs = ['f0', 'src_type']
 
 
 sources = {'Wavelet': WaveletSource, 'Ricker': RickerSource, 'Gabor': GaborSource}
@@ -191,6 +191,23 @@ def seismic_args(description):
     class _dtype_store(Action):
         def __call__(self, parser, args, values, option_string=None):
             values = {'float32': np.float32, 'float64': np.float64}[values]
+            setattr(args, self.dest, values)
+
+    class _opt_action(Action):
+        def __call__(self, parser, args, values, option_string=None):
+            try:
+                # E.g., `('advanced', {'par-tile': True})`
+                values = eval(values)
+                if not isinstance(values, tuple) and len(values) >= 1:
+                    raise ArgumentError(self, ("Invalid choice `%s` (`opt` must be "
+                                               "either str or tuple)" % str(values)))
+                opt = values[0]
+            except NameError:
+                # E.g. `'advanced'`
+                opt = values
+            if opt not in configuration._accepted['opt']:
+                raise ArgumentError(self, ("Invalid choice `%s` (choose from %s)"
+                                           % (opt, str(configuration._accepted['opt']))))
             setattr(args, self.dest, values)
 
     parser = ArgumentParser(description=description)
@@ -207,9 +224,8 @@ def seismic_args(description):
     parser.add_argument("--constant", default=False, action='store_true',
                         help="Constant velocity model, default is a two layer model")
     parser.add_argument("--checkpointing", default=False, action='store_true',
-                        help="Use checkpointing, default is false")
-    parser.add_argument("-opt", default="advanced",
-                        choices=configuration._accepted['opt'],
+                        help="Use checkpointing, default is False")
+    parser.add_argument("-opt", default="advanced", action=_opt_action,
                         help="Performance optimization level")
     parser.add_argument('-a', '--autotune', default='off',
                         choices=(configuration._accepted['autotuning']),

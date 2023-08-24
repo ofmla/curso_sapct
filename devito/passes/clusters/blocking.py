@@ -1,17 +1,18 @@
-from collections import Counter
+from sympy import sympify
 
 from devito.ir.clusters import Queue
-from devito.ir.support import (SEQUENTIAL, SKEWABLE, TILABLE, Interval, IntervalGroup,
-                               IterationSpace)
-from devito.symbolics import uxreplace
-from devito.types import IncrDimension
-
-from devito.symbolics import xreplace_indices
+from devito.ir.support import (AFFINE, PARALLEL, PARALLEL_IF_ATOMIC, PARALLEL_IF_PVT,
+                               SEQUENTIAL, SKEWABLE, TILABLES, Interval,
+                               IntervalGroup, IterationSpace, Scope)
+from devito.passes import is_on_device
+from devito.symbolics import uxreplace, xreplace_indices
+from devito.tools import UnboundedMultiTuple, as_tuple, flatten, is_integer, prod
+from devito.types import BlockDimension
 
 __all__ = ['blocking']
 
 
-def blocking(clusters, options):
+def blocking(clusters, sregistry, options):
     """
     Loop blocking to improve data locality.
 
@@ -21,53 +22,242 @@ def blocking(clusters, options):
         Input Clusters, subject of the optimization pass.
     options : dict
         The optimization options.
-        * `blockinner` (boolean, False): enable/disable loop blocking along the
-           innermost loop.
-        * `blocklevels` (int, 1): 1 => classic loop blocking; 2 for two-level
-           hierarchical blocking.
-        * `skewing` (boolean, False): enable/disable loop skewing.
+        * `blockrelax`: use/ignore heuristics to apply blocking to
+          potentially inexpensive loop nests.
+        * `blockinner`: enable/disable loop blocking along the
+          innermost loop.
+        * `blocklevels`: 1 => classic loop blocking; 2 for two-level
+          hierarchical blocking.
+        * `skewing`: enable/disable loop skewing.
+
+    Examples
+    -------
+    A typical use case, e.g.
+
+                    Classical   +blockinner  2-level Hierarchical
+    for x            for xb        for xb         for xbb
+      for y    -->    for yb        for yb         for ybb
+        for z          for x         for zb         for xb
+                        for y         for x          for yb
+                         for z         for y          for x
+                                        for z          for y
+                                                        for z
 
     Notes
     ------
     In case of skewing, if 'blockinner' is enabled, the innermost loop is also skewed.
     """
-    processed = preprocess(clusters, options)
-
-    if options['blocklevels'] > 0:
-        processed = Blocking(options).process(processed)
+    if options['blockrelax']:
+        if options['blockrelax'] == 'device-aware':
+            analyzer = AnalyzeDeviceAwareBlocking(options)
+        else:
+            analyzer = AnalyzeBlocking(options)
+    else:
+        analyzer = AnalyzeHeuristicBlocking(options)
+    clusters = analyzer.process(clusters)
 
     if options['skewing']:
-        processed = Skewing(options).process(processed)
+        clusters = AnalyzeSkewing().process(clusters)
 
-    return processed
+    if options['blocklevels'] > 0:
+        clusters = SynthesizeBlocking(sregistry, options).process(clusters)
+
+    if options['skewing']:
+        clusters = SynthesizeSkewing(options).process(clusters)
+
+    return clusters
 
 
-class Blocking(Queue):
+class AnayzeBlockingBase(Queue):
 
-    template = "%s%d_blk%s"
+    """
+    Encode the TILABLE property.
+    """
 
     def __init__(self, options):
-        self.inner = bool(options['blockinner'])
-        self.levels = options['blocklevels']
+        super().__init__()
 
-        self.nblocked = Counter()
+        self.skewing = options['skewing']
 
-        super(Blocking, self).__init__()
+    def process(self, clusters):
+        return self._process_fatd(clusters, 1)
 
-    def _make_key_hook(self, cluster, level):
-        return (tuple(cluster.guards.get(i.dim) for i in cluster.itintervals[:level]),)
-
-    def _process_fdta(self, clusters, level, prefix=None):
+    def _process_fatd(self, clusters, level, prefix=None):
         # Truncate recursion in case of TILABLE, non-perfect sub-nests, as
         # it's an unsupported case
         if prefix:
             d = prefix[-1].dim
-            test0 = any(TILABLE in c.properties[d] for c in clusters)
-            test1 = len({c.itintervals[:level] for c in clusters}) > 1
-            if test0 and test1:
-                return self.callback(clusters, prefix)
 
-        return super(Blocking, self)._process_fdta(clusters, level, prefix)
+            if any(c.properties.is_blockable(d) for c in clusters) and \
+               len({c.ispace[:level] for c in clusters}) > 1:
+                return clusters
+
+        return super()._process_fatd(clusters, level, prefix)
+
+    def _has_data_reuse(self, cluster):
+        # A sufficient condition for the existance of data reuse in `cluster`
+        # is that the same Function is accessed twice at the same memory location,
+        # which translates into the existance of any Relation accross Indexeds
+        if any(r.function.is_AbstractFunction for r in cluster.scope.r_gen()):
+            return True
+
+        # If it's a reduction operation a la matrix-matrix multiply, two Indexeds
+        # might be enough
+        if any(PARALLEL_IF_ATOMIC in p for p in cluster.properties.values()):
+            return True
+
+        # If we are going to skew, then we might exploit reuse along an
+        # otherwise SEQUENTIAL Dimension
+        if self.skewing:
+            return True
+
+        return False
+
+    def _has_short_trip_count(self, d):
+        # Iteration spaces of statically known size are always small, at
+        # most a few tens of unit, so they wouldn't benefit from blocking
+        return is_integer(d.symbolic_size)
+
+
+class AnalyzeBlocking(AnayzeBlockingBase):
+
+    def callback(self, clusters, prefix):
+        if not prefix:
+            return clusters
+
+        d = prefix[-1].dim
+        if self._has_short_trip_count(d):
+            return clusters
+
+        processed = []
+        for c in clusters:
+            if not {PARALLEL,
+                    PARALLEL_IF_ATOMIC,
+                    PARALLEL_IF_PVT}.intersection(c.properties[d]):
+                return clusters
+
+            # Pointless if there's no data reuse
+            if not self._has_data_reuse(c):
+                return clusters
+
+            # All good so far, `d` is actually TILABLE
+            processed.append(c.rebuild(properties=c.properties.block(d)))
+
+        return processed
+
+
+class AnalyzeDeviceAwareBlocking(AnalyzeBlocking):
+
+    def __init__(self, options):
+        super().__init__(options)
+
+        self.gpu_fit = options.get('gpu-fit', ())
+
+    def _make_key_hook(self, cluster, level):
+        return (is_on_device(cluster.functions, self.gpu_fit),)
+
+    def callback(self, clusters, prefix):
+        if not prefix:
+            return clusters
+
+        d = prefix[-1].dim
+        if self._has_short_trip_count(d):
+            return clusters
+
+        processed = []
+        for c in clusters:
+            if not c.properties.is_parallel_relaxed(d):
+                return clusters
+
+            if is_on_device(c.functions, self.gpu_fit):
+                if self._has_data_reuse(c):
+                    properties = c.properties.block(d)
+                else:
+                    properties = c.properties.block(d, 'small')
+            elif self._has_data_reuse(c):
+                properties = c.properties.block(d)
+            else:
+                return clusters
+
+            processed.append(c.rebuild(properties=properties))
+
+        return processed
+
+
+class AnalyzeHeuristicBlocking(AnayzeBlockingBase):
+
+    def __init__(self, options):
+        super().__init__(options)
+
+        self.inner = options['blockinner']
+
+    def process(self, clusters):
+        clusters = super().process(clusters)
+
+        # Heuristic: if there aren't at least two TILABLE Dimensions, drop it
+        processed = []
+        for c in clusters:
+            if c.properties.nblockable > 1:
+                processed.append(c)
+            else:
+                properties = c.properties.drop(properties=TILABLES)
+                processed.append(c.rebuild(properties=properties))
+
+        return processed
+
+    def callback(self, clusters, prefix):
+        if not prefix:
+            return clusters
+
+        d = prefix[-1].dim
+        if self._has_short_trip_count(d):
+            return clusters
+
+        # Pointless if there's no data reuse
+        if all(not self._has_data_reuse(c) for c in clusters):
+            return clusters
+
+        # Heuristic: if all Clusters operate on local SubDimensions, then it means
+        # that all IterationSpaces are tiny, hence we can skip
+        if all(any(i.dim.is_Sub and i.dim.local for i in c.ispace) for c in clusters):
+            return clusters
+
+        processed = []
+        for c in clusters:
+            # PARALLEL* and AFFINE are necessary conditions
+            if AFFINE not in c.properties[d] or \
+               not ({PARALLEL, PARALLEL_IF_PVT} & c.properties[d]):
+                return clusters
+
+            # Heuristic: innermost Dimensions may be ruled out a-priori
+            is_inner = d is c.ispace[-1].dim
+            if is_inner and not self.inner:
+                return clusters
+
+            # Heuristic: TILABLE not worth it if not within a SEQUENTIAL Dimension
+            if not any(SEQUENTIAL in c.properties[i.dim] for i in prefix[:-1]):
+                return clusters
+
+            processed.append(c.rebuild(properties=c.properties.block(d)))
+
+        if len(clusters) > 1:
+            # Heuristic: same as above if it induces dynamic bounds
+            exprs = flatten(c.exprs for c in as_tuple(clusters))
+            scope = Scope(exprs)
+            if any(i.is_lex_non_stmt for i in scope.d_all_gen()):
+                return clusters
+        else:
+            # Just avoiding potentially expensive checks
+            pass
+
+        return processed
+
+
+class AnalyzeSkewing(Queue):
+
+    """
+    Encode the SKEWABLE Dimensions.
+    """
 
     def callback(self, clusters, prefix):
         if not prefix:
@@ -75,69 +265,93 @@ class Blocking(Queue):
 
         d = prefix[-1].dim
 
-        # Create the block Dimensions (in total `self.levels` Dimensions)
-        name = self.template % (d.name, self.nblocked[d], '%d')
+        processed = []
+        for c in clusters:
+            if not c.properties.is_blockable(d):
+                return clusters
 
-        bd = IncrDimension(name % 0, d, d.symbolic_min, d.symbolic_max)
-        size = bd.step
+            processed.append(c.rebuild(properties=c.properties.add(d, SKEWABLE)))
+
+        return processed
+
+
+class SynthesizeBlocking(Queue):
+
+    _q_guards_in_key = True
+
+    template = "%s%d_blk%s"
+
+    def __init__(self, sregistry, options):
+        self.sregistry = sregistry
+
+        self.levels = options['blocklevels']
+        self.par_tile = options['par-tile']
+
+        super().__init__()
+
+    def process(self, clusters):
+        # A tool to unroll the explicit integer block shapes, should there be any
+        if self.par_tile:
+            blk_size_gen = BlockSizeGenerator(self.par_tile)
+        else:
+            blk_size_gen = None
+
+        return self._process_fdta(clusters, 1, blk_size_gen=blk_size_gen)
+
+    def callback(self, clusters, prefix, blk_size_gen=None):
+        if not prefix:
+            return clusters
+
+        d = prefix[-1].dim
+
+        if not any(c.properties.is_blockable(d) for c in clusters):
+            return clusters
+
+        # Create the block Dimensions (in total `self.levels` Dimensions)
+        base = self.sregistry.make_name(prefix=d.name)
+
+        if blk_size_gen is not None:
+            # By passing a suitable key to `next` we ensure that we pull the
+            # next par-tile entry iff we're now blocking an unseen TILABLE nest
+            try:
+                step = sympify(blk_size_gen.next(clusters, d))
+            except StopIteration:
+                return clusters
+        else:
+            # This will result in a parametric step, e.g. `x0_blk0_size`
+            step = None
+
+        name = self.sregistry.make_name(prefix="%s_blk" % base)
+        bd = BlockDimension(name, d, d.symbolic_min, d.symbolic_max, step)
+        step = bd.step
         block_dims = [bd]
 
-        for i in range(1, self.levels):
-            bd = IncrDimension(name % i, bd, bd, bd + bd.step - 1, size=size)
+        for _ in range(1, self.levels):
+            name = self.sregistry.make_name(prefix="%s_blk" % base)
+            bd = BlockDimension(name, bd, bd, bd + bd.step - 1, size=step)
             block_dims.append(bd)
 
-        bd = IncrDimension(d.name, bd, bd, bd + bd.step - 1, 1, size=size)
+        bd = BlockDimension(d.name, bd, bd, bd + bd.step - 1, 1, size=step)
         block_dims.append(bd)
 
         processed = []
         for c in clusters:
-            if TILABLE in c.properties[d]:
+            if c.properties.is_blockable(d):
                 ispace = decompose(c.ispace, d, block_dims)
 
-                # Use the innermost IncrDimension in place of `d`
+                # Use the innermost BlockDimension in place of `d`
                 exprs = [uxreplace(e, {d: bd}) for e in c.exprs]
 
-                # The new Cluster properties
-                # TILABLE property is dropped after the blocking.
-                # SKEWABLE is dropped as well, but only from the new
-                # block dimensions.
-                properties = dict(c.properties)
-                properties.pop(d)
-                properties.update({bd: c.properties[d] - {TILABLE} for bd in block_dims})
-                properties.update({bd: c.properties[d] - {SKEWABLE}
-                                  for bd in block_dims[:-1]})
+                # The new Cluster properties -- TILABLE is dropped after blocking
+                properties = c.properties.drop(d)
+                properties = properties.add(block_dims, c.properties[d] - TILABLES)
 
                 processed.append(c.rebuild(exprs=exprs, ispace=ispace,
                                            properties=properties))
             else:
                 processed.append(c)
 
-        # Make sure to use unique IncrDimensions
-        self.nblocked[d] += int(any(TILABLE in c.properties[d] for c in clusters))
-
         return processed
-
-
-def preprocess(clusters, options):
-    # Preprocess: heuristic: drop TILABLE from innermost Dimensions to
-    # maximize vectorization
-    inner = bool(options['blockinner'])
-    processed = []
-    for c in clusters:
-        ntilable = len([i for i in c.properties.values() if TILABLE in i])
-        ntilable -= int(not inner)
-        if ntilable <= 1:
-            properties = {k: v - {TILABLE} for k, v in c.properties.items()}
-            processed.append(c.rebuild(properties=properties))
-        elif not inner:
-            d = c.itintervals[-1].dim
-            properties = dict(c.properties)
-            properties[d] = properties[d] - {TILABLE}
-            processed.append(c.rebuild(properties=properties))
-        else:
-            processed.append(c)
-
-    return processed
 
 
 def decompose(ispace, d, block_dims):
@@ -154,44 +368,40 @@ def decompose(ispace, d, block_dims):
         else:
             intervals.append(i)
 
-    # Create the relations.
-    # Example: consider the relation `(t, x, y)` and assume we decompose `x` over
-    # `xbb, xb, xi`; then we decompose the relation as two relations, `(t, xbb, y)`
-    # and `(xbb, xb, xi)`
-    relations = [block_dims]
-    for r in ispace.intervals.relations:
-        relations.append([block_dims[0] if i is d else i for i in r])
+    # Create the intervals relations
+    # 1: `bbd > bd`
+    relations = [tuple(block_dims)]
 
-    # The level of a given Dimension in the hierarchy of block Dimensions
-    level = lambda dim: len([i for i in dim._defines if i.is_Incr])
-
-    # Add more relations
-    for n, i in enumerate(ispace):
-        if i.dim is d:
+    # 2: Suitably replace `d` with all `bd`'s
+    for r in ispace.relations:
+        if not d._defines.intersection(r):
+            relations.append(r)
             continue
-        elif i.dim.is_Incr:
-            # Make sure IncrDimensions on the same level stick next to each other.
-            # For example, we want `(t, xbb, ybb, xb, yb, x, y)`, rather than say
-            # `(t, xbb, xb, x, ybb, ...)`
-            for bd in block_dims:
-                if level(i.dim) >= level(bd):
-                    relations.append([bd, i.dim])
-                else:
-                    relations.append([i.dim, bd])
-        elif n > ispace.intervals.index(d):
-            # The non-Incr subsequent Dimensions must follow the block Dimensions
-            for bd in block_dims:
-                relations.append([bd, i.dim])
-        else:
-            # All other Dimensions must precede the block Dimensions
-            for bd in block_dims:
-                relations.append([i.dim, bd])
+
+        for bd in block_dims:
+            # Avoid e.g. `x > yb`
+            if any(i._depth < bd._depth for i in r if i.is_Block):
+                continue
+
+            relations.append(tuple(bd if i in d._defines else i for i in r))
+
+    # 3: Make sure BlockDimensions at same depth stick next to each other
+    # E.g., `(t, xbb, ybb, xb, yb, x, y)`, and NOT e.g. `(t, xbb, xb, x, ybb, ...)`
+    # NOTE: this is perfectly legal since:
+    # TILABLE => (perfect nest & PARALLEL) => interchangeable
+    for i in ispace.itdimensions:
+        if not i.is_Block:
+            continue
+        for bd in block_dims:
+            if i._depth < bd._depth:
+                relations.append((i, bd))
 
     intervals = IntervalGroup(intervals, relations=relations)
 
     sub_iterators = dict(ispace.sub_iterators)
     sub_iterators.pop(d, None)
-    sub_iterators.update({bd: ispace.sub_iterators.get(d, []) for bd in block_dims})
+    sub_iterators.update({bd: () for bd in block_dims[:-1]})
+    sub_iterators.update({block_dims[-1]: ispace.sub_iterators[d]})
 
     directions = dict(ispace.directions)
     directions.pop(d)
@@ -200,7 +410,39 @@ def decompose(ispace, d, block_dims):
     return IterationSpace(intervals, sub_iterators, directions)
 
 
-class Skewing(Queue):
+class BlockSizeGenerator(object):
+
+    """
+    A wrapper for several UnboundedMultiTuples.
+    """
+
+    def __init__(self, par_tile):
+        self.umt = UnboundedMultiTuple(*par_tile)
+
+        # This is for Clusters that need a small par-tile to avoid under-utilizing
+        # computational resources (e.g., kernels running over iteration spaces that
+        # are relatively small for the underlying architecture)
+        if (len(par_tile) == 1 and
+            (len(par_tile[0]) < len(par_tile.default) or
+             prod(par_tile[0]) < prod(par_tile.default))):
+            # Ignore if, e.g., user supplies a lower dimensional block shape
+            self.umt_small = self.umt
+        else:
+            self.umt_small = UnboundedMultiTuple(par_tile.default)
+
+    def next(self, clusters, d):
+        # TODO: This is for now exceptionally rudimentary
+        if all(c.properties.is_blockable_small(d) for c in clusters):
+            umt = self.umt_small
+        else:
+            umt = self.umt
+
+        if not any(i.dim.is_Block for i in flatten(c.ispace for c in clusters)):
+            umt.iter()
+        return umt.next()
+
+
+class SynthesizeSkewing(Queue):
 
     """
     Construct a new sequence of clusters with skewed expressions and iteration spaces.
@@ -236,7 +478,7 @@ class Skewing(Queue):
     def __init__(self, options):
         self.skewinner = bool(options['blockinner'])
 
-        super(Skewing, self).__init__()
+        super().__init__()
 
     def callback(self, clusters, prefix):
         if not prefix:
@@ -249,19 +491,15 @@ class Skewing(Queue):
             if SKEWABLE not in c.properties[d]:
                 return clusters
 
-            if d is c.ispace[-1].dim and not self.skewinner:
-                return clusters
-
             skew_dims = {i.dim for i in c.ispace if SEQUENTIAL in c.properties[i.dim]}
             if len(skew_dims) > 1:
                 return clusters
             skew_dim = skew_dims.pop()
 
-            # Since we are here, prefix is skewable and nested under a
-            # SEQUENTIAL loop.
+            # Since we are here, prefix is skewable and nested under a SEQUENTIAL loop
             intervals = []
             for i in c.ispace:
-                if i.dim is d:
+                if i.dim is d and (not d.is_Block or d._depth == 1):
                     intervals.append(Interval(d, skew_dim, skew_dim))
                 else:
                     intervals.append(i)
@@ -270,7 +508,6 @@ class Skewing(Queue):
                                     c.ispace.directions)
 
             exprs = xreplace_indices(c.exprs, {d: d - skew_dim})
-            processed.append(c.rebuild(exprs=exprs, ispace=ispace,
-                                       properties=c.properties))
+            processed.append(c.rebuild(exprs=exprs, ispace=ispace))
 
         return processed

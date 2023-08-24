@@ -37,11 +37,11 @@ class Data(np.ndarray):
     -----
     NumPy array subclassing is described at: ::
 
-        https://docs.scipy.org/doc/numpy-1.13.0/user/basics.subclassing.html
+        https://numpy.org/doc/stable/user/basics.subclassing.html
 
     Any view or copy created from ``self``, for instance via a slice operation
     or a universal function ("ufunc" in NumPy jargon), will still be of type
-    Data.
+    `Data`.
     """
 
     def __new__(cls, shape, dtype, decomposition=None, modulo=None, allocator=ALLOC_FLAT,
@@ -104,7 +104,7 @@ class Data(np.ndarray):
         # that only one object (the "root" Data) will free the C-allocated memory
         self._memfree_args = None
 
-        if type(obj) != Data:
+        if not issubclass(type(obj), Data):
             # Definitely from view casting
             self._is_distributed = False
             self._modulo = tuple(False for i in range(self.ndim))
@@ -155,12 +155,23 @@ class Data(np.ndarray):
         ret._is_distributed = any(i is not None for i in decomposition)
         return ret
 
+    def _prune_shape(self, shape):
+        # Reduce distributed MPI `Data`'s shape to that of an equivalently
+        # sliced numpy array.
+        decomposition = tuple(d for d in self._decomposition if d.size > 1)
+        retval = self.reshape(shape)
+        retval._decomposition = decomposition
+        return retval
+
     def _check_idx(func):
         """Check if __getitem__/__setitem__ may require communication across MPI ranks."""
         @wraps(func)
         def wrapper(data, *args, **kwargs):
             glb_idx = args[0]
-            if len(args) > 1 and isinstance(args[1], Data) \
+            is_gather = isinstance(kwargs.get('gather_rank', None), int)
+            if is_gather and all(i == slice(None, None, 1) for i in glb_idx):
+                comm_type = gather
+            elif len(args) > 1 and isinstance(args[1], Data) \
                     and args[1]._is_mpi_distributed:
                 comm_type = index_by_index
             elif data._is_mpi_distributed:
@@ -189,9 +200,47 @@ class Data(np.ndarray):
     @_check_idx
     def __getitem__(self, glb_idx, comm_type, gather_rank=None):
         loc_idx = self._index_glb_to_loc(glb_idx)
-        is_gather = True if isinstance(gather_rank, int) else False
-        if comm_type is index_by_index or is_gather:
-            # Retrieve the pertinent local data prior to mpi send/receive operations
+        is_gather = isinstance(gather_rank, int)
+        if is_gather and comm_type is gather:
+            comm = self._distributor.comm
+            rank = comm.Get_rank()
+
+            sendbuf = self.flat[:]
+            sendcounts = np.array(comm.gather(len(sendbuf), gather_rank))
+
+            if rank == gather_rank:
+                recvbuf = np.zeros(sum(sendcounts), dtype=self.dtype.type)
+            else:
+                recvbuf = None
+            comm.Gatherv(sendbuf=sendbuf, recvbuf=(recvbuf, sendcounts), root=gather_rank)
+
+            # Reshape the gathered data to produce the output
+            if rank == gather_rank:
+                if len(self.shape) > len(self._distributor.glb_shape):
+                    glb_shape = list(self._distributor.glb_shape)
+                    for i in range(len(self.shape) - len(self._distributor.glb_shape)):
+                        glb_shape.insert(i, self.shape[i])
+                else:
+                    glb_shape = self._distributor.glb_shape
+                retval = np.zeros(glb_shape, dtype=self.dtype.type)
+                start, stop, step = 0, 0, 1
+                for i, _ in enumerate(sendcounts):
+                    if i > 0:
+                        start += sendcounts[i-1]
+                    stop += sendcounts[i]
+                    data_slice = recvbuf[slice(start, stop, step)]
+                    shape = [r.stop-r.start for r in self._distributor.all_ranges[i]]
+                    idx = [slice(r.start, r.stop, r.step)
+                           for r in self._distributor.all_ranges[i]]
+                    for i in range(len(self.shape) - len(self._distributor.glb_shape)):
+                        shape.insert(i, glb_shape[i])
+                        idx.insert(i, slice(0, glb_shape[i]+1, 1))
+                    retval[tuple(idx)] = data_slice.reshape(tuple(shape))
+                return retval
+            else:
+                return None
+        elif comm_type is index_by_index or is_gather:
+            # Retrieve the pertinent local data prior to MPI send/receive operations
             data_idx = loc_data_idx(loc_idx)
             self._index_stash = flip_idx(glb_idx, self._decomposition)
             local_val = super(Data, self).__getitem__(data_idx)
@@ -208,11 +257,12 @@ class Data(np.ndarray):
             if not is_gather:
                 retval = Data(local_val.shape, local_val.dtype.type,
                               decomposition=local_val._decomposition,
-                              modulo=(False,)*len(local_val.shape))
+                              modulo=(False,)*len(local_val.shape),
+                              distributor=local_val._distributor)
             elif rank == gather_rank:
                 retval = np.zeros(it.shape)
             else:
-                retval = np.empty((0, )*len(it.shape))
+                retval = None
             # Iterate over each element of data
             while not it.finished:
                 index = it.multi_index
@@ -247,7 +297,17 @@ class Data(np.ndarray):
                 else:
                     pass
                 it.iternext()
-            return retval
+            # Check if dimensions of the view should now be reduced to
+            # be consistent with those of an equivalent NumPy serial view
+            if not is_gather:
+                newshape = tuple(s for s, i in zip(retval.shape, loc_idx)
+                                 if type(i) is not np.int64)
+            else:
+                newshape = ()
+            if newshape and (0 not in newshape) and (newshape != retval.shape):
+                return retval._prune_shape(newshape)
+            else:
+                return retval
         elif loc_idx is NONLOCAL:
             # Caller expects a scalar. However, `glb_idx` doesn't belong to
             # self's data partition, so None is returned
@@ -359,6 +419,11 @@ class Data(np.ndarray):
 
     def _process_args(self, idx, val):
         """If comm_type is parallel we need to first retrieve local unflipped data."""
+        if (len(as_tuple(idx)) < len(val.shape)) and (len(val.shape) <= len(self.shape)):
+            idx_processed = as_list(idx)
+            for _ in range(len(val.shape)-len(as_tuple(idx))):
+                idx_processed.append(slice(None, None, 1))
+            idx = as_tuple(idx_processed)
         if any(isinstance(i, slice) and i.step is not None and i.step < 0
                for i in as_tuple(idx)):
             processed = []
@@ -415,8 +480,7 @@ class Data(np.ndarray):
                 # Need to wrap index based on modulo
                 v = index_apply_modulo(i, s)
             elif self._is_distributed is True and dec is not None:
-                # Need to convert the user-provided global indices into local indices.
-                # Obviously this will have no effect if MPI is not used
+                # Convert the user-provided global indices into local indices.
                 try:
                     v = convert_index(i, dec, mode='glb_to_loc')
                 except TypeError:
@@ -433,7 +497,7 @@ class Data(np.ndarray):
             loc_idx.append(v)
 
         # Deal with NONLOCAL accesses
-        if NONLOCAL in loc_idx:
+        if any(j is NONLOCAL for j in loc_idx):
             if len(loc_idx) == self.ndim and index_is_basic(loc_idx):
                 # Caller expecting a scalar -- it will eventually get None
                 loc_idx = [NONLOCAL]
@@ -526,4 +590,5 @@ class Data(np.ndarray):
 class CommType(Tag):
     pass
 index_by_index = CommType('index_by_index')  # noqa
-serial = CommType('serial')
+serial = CommType('serial')  # noqa
+gather = CommType('gather')  # noqa
